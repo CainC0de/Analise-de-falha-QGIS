@@ -37,4 +37,3 @@ def classFactory(iface):
     #
     from .Falhadeplantio import FalhaDePlantioPlugin
     return FalhaDePlantioPlugin()
-    

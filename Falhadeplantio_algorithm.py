@@ -26,6 +26,7 @@ __author__ = ''
 __date__ = '2022-09-25'
 __copyright__ = '(C) 2022 by '
 
+# This will get replaced with a git SHA1 when you do a git archive
 
 from qgis.core import (QgsProcessing,
                        QgsProcessingAlgorithm,
@@ -50,9 +51,12 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         results = {}
         outputs = {}
         
+        # Sincroniza o contexto de coordenadas do projeto para evitar erros de latitude
         context.setTransformContext(QgsProject.instance().transformContext())
+        # Captura o CRS do projeto para "ensinar" ao PNG onde ele está
         project_crs = QgsProject.instance().crs().authid()
 
+        # 1. BUFFER NO CONTORNO (Evita processar ruídos fora do limite)
         alg_params = {
             'DISSOLVE': False, 'DISTANCE': 0.1, 'END_CAP_STYLE': 0,
             'INPUT': parameters['quadra'], 'JOIN_STYLE': 0, 'MITER_LIMIT': 2,
@@ -61,29 +65,32 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         outputs['BufferContorno'] = processing.run('native:buffer', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
         feedback.setCurrentStep(1)
 
-       
+        # 2. RECORTAR RASTER (Correção do erro "Cannot find source SRS")
+        # Forçamos o SOURCE_CRS com o sistema do projeto para o PNG ser aceito
         alg_params = {
             'ALPHA_BAND': False, 'CROP_TO_CUTLINE': True, 'DATA_TYPE': 0,
             'INPUT': parameters['gligreenleafindex'],
             'MASK': outputs['BufferContorno']['OUTPUT'],
             'NODATA': 0, 
-            'SOURCE_CRS': project_crs, 
+            'SOURCE_CRS': project_crs, # Força o CRS do projeto no PNG
             'TARGET_CRS': project_crs,
             'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
         }
         outputs['RasterRecortado'] = processing.run('gdal:cliprasterbymasklayer', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
         feedback.setCurrentStep(2)
 
+        # 3. CÁLCULO DO ÍNDICE GLI (Substituindo LF Tools por GDAL Nativo)
         alg_params = {
-            'INPUT_A': outputs['RasterRecortado']['OUTPUT'], 'BAND_A': 2, 
-            'INPUT_B': outputs['RasterRecortado']['OUTPUT'], 'BAND_B': 1, 
-            'INPUT_C': outputs['RasterRecortado']['OUTPUT'], 'BAND_C': 3, 
+            'INPUT_A': outputs['RasterRecortado']['OUTPUT'], 'BAND_A': 2, # Verde
+            'INPUT_B': outputs['RasterRecortado']['OUTPUT'], 'BAND_B': 1, # Vermelho
+            'INPUT_C': outputs['RasterRecortado']['OUTPUT'], 'BAND_C': 3, # Azul
             'FORMULA': '(2.0*A - B - C) / (2.0*A + B + C + 0.0001)',
             'RTYPE': 5, 'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
         }
         outputs['CalculoGLI'] = processing.run('gdal:rastercalculator', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
         feedback.setCurrentStep(3)
 
+        # 4. MÁSCARA DE VEGETAÇÃO (Identifica o que é planta)
         alg_params = {
             'INPUT_A': outputs['CalculoGLI']['OUTPUT'], 'BAND_A': 1,
             'FORMULA': '(A > 0) * 1', 'RTYPE': 5, 'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
@@ -91,6 +98,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         outputs['MascaraBinaria'] = processing.run('gdal:rastercalculator', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
         feedback.setCurrentStep(4)
 
+        # 5. POLIGONIZAR (Transforma pixels de planta em polígonos)
         alg_params = {
             'INPUT': outputs['MascaraBinaria']['OUTPUT'],
             'BAND': 1, 'FIELD': 'DN', 'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
@@ -98,6 +106,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         outputs['Vetorizar'] = processing.run('gdal:polygonize', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
         feedback.setCurrentStep(5)
 
+        # 6. EXTRAIR APENAS VEGETAÇÃO (DN=1)
         alg_params = {
             'FIELD': 'DN', 'INPUT': outputs['Vetorizar']['OUTPUT'],
             'OPERATOR': 0, 'VALUE': '1', 'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
@@ -105,6 +114,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         outputs['ExtrairPlanta'] = processing.run('native:extractbyattribute', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
         feedback.setCurrentStep(6)
 
+        # 7. RECORTAR LINHAS PELO CONTORNO
         alg_params = {
             'INPUT': parameters['linhaplantio'],
             'MASK': outputs['BufferContorno']['OUTPUT'],
@@ -113,6 +123,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         outputs['LinhasNoTalhao'] = processing.run('gdal:clipvectorbypolygon', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
         feedback.setCurrentStep(7)
 
+        # 8. DIFERENÇA (Gera as falhas: Linha original menos a Vegetação)
         alg_params = {
             'INPUT': outputs['LinhasNoTalhao']['OUTPUT'],
             'OVERLAY': outputs['ExtrairPlanta']['OUTPUT'],
@@ -121,6 +132,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         outputs['GerarFalhas'] = processing.run('native:difference', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
         feedback.setCurrentStep(8)
 
+        # 9. EXPLODIR MULTIPARTES
         alg_params = {
             'INPUT': outputs['GerarFalhas']['OUTPUT'],
             'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
@@ -128,6 +140,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         outputs['PartesSimples'] = processing.run('native:multiparttosingleparts', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
         feedback.setCurrentStep(9)
 
+        # 10. CALCULAR COMPRIMENTO (comp_m)
         alg_params = {
             'FIELD_LENGTH': 10, 'FIELD_NAME': 'comp_m', 'FIELD_PRECISION': 2, 'FIELD_TYPE': 0,
             'FORMULA': '$length', 'INPUT': outputs['PartesSimples']['OUTPUT'],
