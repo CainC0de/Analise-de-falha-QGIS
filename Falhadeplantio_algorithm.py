@@ -22,11 +22,10 @@
  ***************************************************************************/
 """
 
-__author__ = 'cainc0de'
+__author__ = ''
 __date__ = '2022-09-25'
 __copyright__ = '(C) 2022 by '
 
-# This will get replaced with a git SHA1 when you do a git archive
 
 from qgis.core import (QgsProcessing,
                        QgsProcessingAlgorithm,
@@ -41,109 +40,106 @@ from qgis.PyQt.QtGui import QIcon
 class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
 
     def initAlgorithm(self, config=None):
-        self.addParameter(QgsProcessingParameterRasterLayer('gligreenleafindex', '1. Raster para Análise (Drone)', defaultValue=None))
-        self.addParameter(QgsProcessingParameterRasterLayer('input_raster_linhas', '2. [OPCIONAL] Imagem para GERAR Linhas Automáticas', defaultValue=None, optional=True))
-        self.addParameter(QgsProcessingParameterVectorLayer('linhaplantio', '3. [OPCIONAL] Camada de Linhas Manual', types=[QgsProcessing.TypeVectorLine], defaultValue=None, optional=True))
-        self.addParameter(QgsProcessingParameterVectorLayer('quadra', '4. Contorno do Talhão', types=[QgsProcessing.TypeVectorPolygon], defaultValue=None))
-        
-        self.addParameter(QgsProcessingParameterFeatureSink('LinhasGeradasOutput', 'Linhas de Plantio Extraídas (Visualização)', type=QgsProcessing.TypeVectorLine, createByDefault=True, optional=True, defaultValue=None))
-        self.addParameter(QgsProcessingParameterFeatureSink('FalhaDePlantio', 'Resultado Final das Falhas', type=QgsProcessing.TypeVectorAnyGeometry, createByDefault=True, supportsAppend=True, defaultValue=None))
+        self.addParameter(QgsProcessingParameterRasterLayer('gligreenleafindex', 'Raster RGB (Drone/Imagem)', defaultValue=None))
+        self.addParameter(QgsProcessingParameterVectorLayer('linhaplantio', 'Linhas de Plantio', types=[QgsProcessing.TypeVectorLine], defaultValue=None))
+        self.addParameter(QgsProcessingParameterVectorLayer('quadra', 'Contorno do Talhão', types=[QgsProcessing.TypeVectorPolygon], defaultValue=None))
+        self.addParameter(QgsProcessingParameterFeatureSink('FalhaDePlantio', 'Resultado das Falhas (Linhas)', type=QgsProcessing.TypeVectorAnyGeometry, createByDefault=True, supportsAppend=True, defaultValue=None))
 
     def processAlgorithm(self, parameters, context, model_feedback):
-        feedback = QgsProcessingMultiStepFeedback(15, model_feedback)
+        feedback = QgsProcessingMultiStepFeedback(11, model_feedback)
         results = {}
         outputs = {}
         
         context.setTransformContext(QgsProject.instance().transformContext())
         project_crs = QgsProject.instance().crs().authid()
 
-        # --- FASE 1: DEFINIÇÃO DAS LINHAS DE PLANTIO ---
-        if parameters['input_raster_linhas']:
-            feedback.pushInfo('Iniciando extração automática de linhas...')
-            
-            # A. Binarização (CORREÇÃO: RTYPE 1 para compatibilidade com GRASS)
-            alg_params = {
-                'INPUT_A': parameters['input_raster_linhas'], 'BAND_A': 2,
-                'INPUT_B': parameters['input_raster_linhas'], 'BAND_B': 1,
-                'INPUT_C': parameters['input_raster_linhas'], 'BAND_C': 3,
-                'FORMULA': '((2.0*A-B-C)/(2.0*A+B+C+0.0001)) > 0', 
-                'RTYPE': 1, # Tipo Inteiro (CELL)
-                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
-            }
-            outputs['BinarioAuto'] = processing.run('gdal:rastercalculator', alg_params, context=context, feedback=feedback)
+        alg_params = {
+            'DISSOLVE': False, 'DISTANCE': 0.1, 'END_CAP_STYLE': 0,
+            'INPUT': parameters['quadra'], 'JOIN_STYLE': 0, 'MITER_LIMIT': 2,
+            'SEGMENTS': 5, 'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
+        }
+        outputs['BufferContorno'] = processing.run('native:buffer', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+        feedback.setCurrentStep(1)
 
-            # B. Esqueletização (r.thin)
-            alg_params = {
-                'input': outputs['BinarioAuto']['OUTPUT'], 'iterations': 200,
-                'output': QgsProcessing.TEMPORARY_OUTPUT
-            }
-            outputs['Esqueleto'] = processing.run('grass7:r.thin', alg_params, context=context, feedback=feedback)
+       
+        alg_params = {
+            'ALPHA_BAND': False, 'CROP_TO_CUTLINE': True, 'DATA_TYPE': 0,
+            'INPUT': parameters['gligreenleafindex'],
+            'MASK': outputs['BufferContorno']['OUTPUT'],
+            'NODATA': 0, 
+            'SOURCE_CRS': project_crs, 
+            'TARGET_CRS': project_crs,
+            'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
+        }
+        outputs['RasterRecortado'] = processing.run('gdal:cliprasterbymasklayer', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+        feedback.setCurrentStep(2)
 
-            # C. Vetorização (r.to.vect)
-            alg_params = {
-                'input': outputs['Esqueleto']['output'], 'type': 0,
-                'output': parameters['LinhasGeradasOutput']
-            }
-            outputs['LinhasProcessadas'] = processing.run('grass7:r.to.vect', alg_params, context=context, feedback=feedback)
-            
-            v_linhas_base = outputs['LinhasProcessadas']['output']
-            results['LinhasGeradasOutput'] = v_linhas_base
-        else:
-            v_linhas_base = parameters['linhaplantio']
+        alg_params = {
+            'INPUT_A': outputs['RasterRecortado']['OUTPUT'], 'BAND_A': 2, 
+            'INPUT_B': outputs['RasterRecortado']['OUTPUT'], 'BAND_B': 1, 
+            'INPUT_C': outputs['RasterRecortado']['OUTPUT'], 'BAND_C': 3, 
+            'FORMULA': '(2.0*A - B - C) / (2.0*A + B + C + 0.0001)',
+            'RTYPE': 5, 'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
+        }
+        outputs['CalculoGLI'] = processing.run('gdal:rastercalculator', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+        feedback.setCurrentStep(3)
 
-        # --- FASE 2: ANÁLISE DE FALHAS ---
+        alg_params = {
+            'INPUT_A': outputs['CalculoGLI']['OUTPUT'], 'BAND_A': 1,
+            'FORMULA': '(A > 0) * 1', 'RTYPE': 5, 'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
+        }
+        outputs['MascaraBinaria'] = processing.run('gdal:rastercalculator', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+        feedback.setCurrentStep(4)
+
+        alg_params = {
+            'INPUT': outputs['MascaraBinaria']['OUTPUT'],
+            'BAND': 1, 'FIELD': 'DN', 'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
+        }
+        outputs['Vetorizar'] = processing.run('gdal:polygonize', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
         feedback.setCurrentStep(5)
-        
-        # 1. Recortar Raster
-        outputs['RasterRecortado'] = processing.run('gdal:cliprasterbymasklayer', {
-            'INPUT': parameters['gligreenleafindex'], 'MASK': parameters['quadra'],
-            'SOURCE_CRS': project_crs, 'TARGET_CRS': project_crs, 'NODATA': 0,
+
+        alg_params = {
+            'FIELD': 'DN', 'INPUT': outputs['Vetorizar']['OUTPUT'],
+            'OPERATOR': 0, 'VALUE': '1', 'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
+        }
+        outputs['ExtrairPlanta'] = processing.run('native:extractbyattribute', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+        feedback.setCurrentStep(6)
+
+        alg_params = {
+            'INPUT': parameters['linhaplantio'],
+            'MASK': outputs['BufferContorno']['OUTPUT'],
             'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
-        }, context=context, feedback=feedback)
+        }
+        outputs['LinhasNoTalhao'] = processing.run('gdal:clipvectorbypolygon', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+        feedback.setCurrentStep(7)
 
-        # 2. Máscara de Vegetação (RTYPE 1 para consistência)
-        outputs['VegetacaoMascara'] = processing.run('gdal:rastercalculator', {
-            'INPUT_A': outputs['RasterRecortado']['OUTPUT'], 'BAND_A': 2,
-            'INPUT_B': outputs['RasterRecortado']['OUTPUT'], 'BAND_B': 1,
-            'INPUT_C': outputs['RasterRecortado']['OUTPUT'], 'BAND_C': 3,
-            'FORMULA': '((2.0*A-B-C)/(2.0*A+B+C+0.0001)) > 0',
-            'RTYPE': 1, 'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
-        }, context=context, feedback=feedback)
-
-        # 3. Poligonizar
-        outputs['VegetacaoVetor'] = processing.run('gdal:polygonize', {
-            'INPUT': outputs['VegetacaoMascara']['OUTPUT'], 'FIELD': 'DN', 
+        alg_params = {
+            'INPUT': outputs['LinhasNoTalhao']['OUTPUT'],
+            'OVERLAY': outputs['ExtrairPlanta']['OUTPUT'],
             'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
-        }, context=context, feedback=feedback)
+        }
+        outputs['GerarFalhas'] = processing.run('native:difference', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+        feedback.setCurrentStep(8)
 
-        # 4. Extrair Cana (DN=1)
-        outputs['CanaPoligonos'] = processing.run('native:extractbyattribute', {
-            'FIELD': 'DN', 'INPUT': outputs['VegetacaoVetor']['OUTPUT'], 'OPERATOR': 0, 'VALUE': '1', 
+        alg_params = {
+            'INPUT': outputs['GerarFalhas']['OUTPUT'],
             'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
-        }, context=context, feedback=feedback)
+        }
+        outputs['PartesSimples'] = processing.run('native:multiparttosingleparts', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
+        feedback.setCurrentStep(9)
 
-        # 5. Diferença (Linhas - Cana)
-        outputs['FalhasLinhas'] = processing.run('native:difference', {
-            'INPUT': v_linhas_base, 'OVERLAY': outputs['CanaPoligonos']['OUTPUT'],
-            'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
-        }, context=context, feedback=feedback)
+        alg_params = {
+            'FIELD_LENGTH': 10, 'FIELD_NAME': 'comp_m', 'FIELD_PRECISION': 2, 'FIELD_TYPE': 0,
+            'FORMULA': '$length', 'INPUT': outputs['PartesSimples']['OUTPUT'],
+            'OUTPUT': parameters['FalhaDePlantio']
+        }
+        outputs['ResultadoFinal'] = processing.run('native:fieldcalculator', alg_params, context=context, feedback=feedback, is_child_algorithm=True)
 
-        # 6. Multipartes para Simples
-        outputs['SingleParts'] = processing.run('native:multiparttosingleparts', {
-            'INPUT': outputs['FalhasLinhas']['OUTPUT'], 'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT
-        }, context=context, feedback=feedback)
-
-        # 7. Calcular Comprimento
-        processing.run('native:fieldcalculator', {
-            'FIELD_NAME': 'comp_m', 'FIELD_TYPE': 0, 'FORMULA': '$length',
-            'INPUT': outputs['SingleParts']['OUTPUT'], 'OUTPUT': parameters['FalhaDePlantio']
-        }, context=context, feedback=feedback)
-
-        results['FalhaDePlantio'] = parameters['FalhaDePlantio']
+        results['FalhaDePlantio'] = outputs['ResultadoFinal']['OUTPUT']
         return results
 
-    def name(self): return 'falha_hibrida_cana'
-    def displayName(self): return 'Falha de Plantio (Cana - Auto/Manual)'
+    def name(self): return 'falha_plantio_estavel'
+    def displayName(self): return 'Falha de Plantio (Cana-de-açúcar)'
     def group(self): return 'Análise'
     def groupId(self): return 'Análise'
     def createInstance(self): return FalhaDePlantioAlgorithm()
