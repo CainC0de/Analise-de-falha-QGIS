@@ -1,49 +1,31 @@
-# This file contains metadata for your plugin.
-
-# This file should be included when you package your plugin.# Mandatory items:
-
 [general]
-name=Falha de plantio
+name=Falha de Plantio
 qgisMinimumVersion=3.22
-description=Plugin utilizado para mapeamento de falhas de plantio na cultura de cana-de-açúcar, Refaturado e bugs corrigidos, Free Source
+description=Plugin para mapeamento de falhas de plantio na cultura de cana-de-açúcar utilizando imagens RGB/NDVI de drone ou satélite. Suporta GLI e NDVI, com threshold configurável e estatísticas automáticas.
 version=2.0
 author=CainC0de
 email=
 
-about=Mapeamento de falha de plantio na cultura de cana-de-açúcar - sobre
+about=Ferramenta de análise geoespacial para detecção automática de falhas de plantio em cana-de-açúcar. Utiliza índices de vegetação (GLI ou NDVI) para comparar linhas de plantio com a cobertura vegetal real, identificando segmentos sem vegetação. Gera linhas de falha com comprimento em metros e estatísticas detalhadas (total, média, percentual de falha).
 
-tracker=
-repository=http://repo
-# End of mandatory metadata
-
-# Recommended items:
+tracker=https://github.com/CainC0de/Analise-de-falha-QGIS/issues
+repository=https://github.com/CainC0de/Analise-de-falha-QGIS
 
 hasProcessingProvider=yes
-# Uncomment the following line and add your changelog:
-changelog= 
-	0.1 - Lançamento da ferramenta
-	0.2 - correção de bugs
-	1.0 - versão estável
-# Tags are comma separated with spaces allowed
-tags=python
 
-homepage=https://
+changelog=
+    2.0 - Versão refatorada: suporte NDVI, threshold configurável, filtro de comprimento mínimo, estatísticas automáticas, tratamento de erros robusto, verificação de cancelamento
+    1.0 - Versão estável
+    0.2 - Correção de bugs
+    0.1 - Lançamento da ferramenta
+
+tags=agriculture,sugarcane,cana,plantio,falha,failure,remote sensing,sensoriamento remoto,drone,vegetation index,GLI,NDVI,analysis
+
+homepage=https://github.com/CainC0de/Analise-de-falha-QGIS
 category=Analysis
 icon=canaicone.png
-# experimental flag
-experimental=True
 
-# deprecated flag (applies to the whole plugin, not just a single version)
+experimental=False
 deprecated=False
 
-# Since QGIS 3.8, a comma separated list of plugins to be installed
-# (or upgraded) can be specified.
-# Check the documentation for more information.
-# plugin_dependencies=
-
-Category of the plugin: Raster, Vector, Database or Web
-# category=
-
-# If the plugin can run on QGIS Server.
 server=False
-
