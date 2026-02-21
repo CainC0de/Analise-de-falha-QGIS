@@ -4,6 +4,10 @@ __date__ = '2022-09-25'
 __copyright__ = '(C) 2026 CainC0de'
 
 import logging
+import os
+import tempfile
+import numpy as np
+from osgeo import gdal, ogr, osr, gdal_array
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
@@ -16,11 +20,14 @@ from qgis.core import (
     QgsProcessingParameterBoolean,
     QgsProcessingOutputString,
     QgsProject,
+    QgsRasterLayer,
 )
 import processing
 from qgis.PyQt.QtGui import QIcon
 
 logger = logging.getLogger('FalhaDePlantio')
+
+gdal.UseExceptions()
 
 
 class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
@@ -162,11 +169,16 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         context.setTransformContext(QgsProject.instance().transformContext())
         project_crs = QgsProject.instance().crs().authid()
 
+        raster_layer = self.parameterAsRasterLayer(parameters, self.INPUT_RASTER, context)
+        raster_path = raster_layer.source()
+
         logger.info(
             'Análise de falha: índice=%s, threshold=%.3f, sieve=%d, '
             'resolução=%.3f, simplificação=%.3f',
             self.INDEX_CHOICES[indice], threshold, sieve_size,
             resolucao, simplify_tol)
+
+        tmp_dir = tempfile.mkdtemp(prefix='falha_plantio_')
 
         step += 1
         feedback.pushInfo(f'Passo {step}/{self.TOTAL_STEPS}: Criando buffer no contorno...')
@@ -194,20 +206,13 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         step += 1
         feedback.pushInfo(f'Passo {step}/{self.TOTAL_STEPS}: Recortando raster pelo contorno...')
         try:
-            alg_params = {
-                'ALPHA_BAND': False,
-                'CROP_TO_CUTLINE': True,
-                'DATA_TYPE': 0,
-                'INPUT': parameters[self.INPUT_RASTER],
-                'MASK': outputs['BufferContorno']['OUTPUT'],
-                'NODATA': 0,
-                'SOURCE_CRS': project_crs,
-                'TARGET_CRS': project_crs,
-                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-            }
-            outputs['RasterRecortado'] = processing.run(
-                'gdal:cliprasterbymasklayer', alg_params,
-                context=context, feedback=feedback, is_child_algorithm=True)
+            clipped_path = os.path.join(tmp_dir, 'clipped.tif')
+            self._clip_raster_by_mask(
+                raster_path,
+                outputs['BufferContorno']['OUTPUT'],
+                clipped_path,
+                context, feedback)
+            outputs['RasterRecortado'] = {'OUTPUT': clipped_path}
         except Exception as e:
             feedback.reportError(f'Erro ao recortar raster: {e}', fatalError=True)
             return {}
@@ -216,32 +221,12 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             return {}
 
         step += 1
-        if indice == 0:
-            feedback.pushInfo(f'Passo {step}/{self.TOTAL_STEPS}: Calculando índice GLI (RGB)...')
-            formula = '(2.0*A - B - C) / (2.0*A + B + C + 0.0001)'
-            alg_params = {
-                'INPUT_A': outputs['RasterRecortado']['OUTPUT'], 'BAND_A': 2,
-                'INPUT_B': outputs['RasterRecortado']['OUTPUT'], 'BAND_B': 1,
-                'INPUT_C': outputs['RasterRecortado']['OUTPUT'], 'BAND_C': 3,
-                'FORMULA': formula,
-                'RTYPE': 5,
-                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-            }
-        else:
-            feedback.pushInfo(
-                f'Passo {step}/{self.TOTAL_STEPS}: Calculando NDVI (NIR={banda_nir})...')
-            formula = '(A - B) / (A + B + 0.0001)'
-            alg_params = {
-                'INPUT_A': outputs['RasterRecortado']['OUTPUT'], 'BAND_A': banda_nir,
-                'INPUT_B': outputs['RasterRecortado']['OUTPUT'], 'BAND_B': 1,
-                'FORMULA': formula,
-                'RTYPE': 5,
-                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-            }
+        feedback.pushInfo(f'Passo {step}/{self.TOTAL_STEPS}: Calculando índice de vegetação...')
         try:
-            outputs['CalculoIndice'] = processing.run(
-                'gdal:rastercalculator', alg_params,
-                context=context, feedback=feedback, is_child_algorithm=True)
+            indice_path = os.path.join(tmp_dir, 'indice.tif')
+            self._calc_vegetation_index(
+                clipped_path, indice_path, indice, banda_nir, feedback)
+            outputs['CalculoIndice'] = {'OUTPUT': indice_path}
         except Exception as e:
             feedback.reportError(f'Erro no índice de vegetação: {e}', fatalError=True)
             return {}
@@ -252,17 +237,11 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         step += 1
         feedback.pushInfo(
             f'Passo {step}/{self.TOTAL_STEPS}: Máscara binária '
-            f'(threshold={threshold}, tipo=Byte)...')
+            f'(threshold={threshold})...')
         try:
-            alg_params = {
-                'INPUT_A': outputs['CalculoIndice']['OUTPUT'], 'BAND_A': 1,
-                'FORMULA': f'(A > {threshold}) * 1',
-                'RTYPE': 1,
-                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-            }
-            outputs['MascaraBinaria'] = processing.run(
-                'gdal:rastercalculator', alg_params,
-                context=context, feedback=feedback, is_child_algorithm=True)
+            mask_path = os.path.join(tmp_dir, 'mask.tif')
+            self._calc_binary_mask(indice_path, mask_path, threshold, feedback)
+            outputs['MascaraBinaria'] = {'OUTPUT': mask_path}
         except Exception as e:
             feedback.reportError(f'Erro na máscara de vegetação: {e}', fatalError=True)
             return {}
@@ -276,54 +255,37 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
                 f'Passo {step}/{self.TOTAL_STEPS}: Sieve filter '
                 f'(removendo grupos < {sieve_size} pixels)...')
             try:
-                alg_params = {
-                    'INPUT': outputs['MascaraBinaria']['OUTPUT'],
-                    'THRESHOLD': sieve_size,
-                    'EIGHT_CONNECTEDNESS': False,
-                    'NO_MASK': False,
-                    'MASK_LAYER': None,
-                    'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-                }
-                outputs['SieveFiltrado'] = processing.run(
-                    'gdal:sieve', alg_params,
-                    context=context, feedback=feedback, is_child_algorithm=True)
+                sieved_path = os.path.join(tmp_dir, 'sieved.tif')
+                self._apply_sieve(mask_path, sieved_path, sieve_size, feedback)
+                outputs['SieveFiltrado'] = {'OUTPUT': sieved_path}
             except Exception as e:
                 feedback.reportError(f'Erro no sieve filter: {e}', fatalError=True)
                 return {}
         else:
             feedback.pushInfo(
                 f'Passo {step}/{self.TOTAL_STEPS}: Sieve filter desabilitado (tamanho=0).')
-            outputs['SieveFiltrado'] = {'OUTPUT': outputs['MascaraBinaria']['OUTPUT']}
+            outputs['SieveFiltrado'] = {'OUTPUT': mask_path}
         feedback.setCurrentStep(step)
         if feedback.isCanceled():
             return {}
 
         step += 1
+        current_raster = outputs['SieveFiltrado']['OUTPUT']
         if resolucao > 0:
             feedback.pushInfo(
                 f'Passo {step}/{self.TOTAL_STEPS}: Reamostrando para '
                 f'{resolucao}m de resolução...')
             try:
-                alg_params = {
-                    'INPUT': outputs['SieveFiltrado']['OUTPUT'],
-                    'SOURCE_CRS': project_crs,
-                    'TARGET_CRS': project_crs,
-                    'RESAMPLING': 0,
-                    'TARGET_RESOLUTION': resolucao,
-                    'NODATA': 0,
-                    'DATA_TYPE': 1,
-                    'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-                }
-                outputs['Reamostrado'] = processing.run(
-                    'gdal:warpreproject', alg_params,
-                    context=context, feedback=feedback, is_child_algorithm=True)
+                resampled_path = os.path.join(tmp_dir, 'resampled.tif')
+                self._resample_raster(current_raster, resampled_path, resolucao, feedback)
+                outputs['Reamostrado'] = {'OUTPUT': resampled_path}
             except Exception as e:
                 feedback.reportError(f'Erro na reamostragem: {e}', fatalError=True)
                 return {}
         else:
             feedback.pushInfo(
                 f'Passo {step}/{self.TOTAL_STEPS}: Reamostragem desabilitada (resolução=0).')
-            outputs['Reamostrado'] = {'OUTPUT': outputs['SieveFiltrado']['OUTPUT']}
+            outputs['Reamostrado'] = {'OUTPUT': current_raster}
         feedback.setCurrentStep(step)
         if feedback.isCanceled():
             return {}
@@ -332,16 +294,9 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(
             f'Passo {step}/{self.TOTAL_STEPS}: Convertendo raster em polígonos...')
         try:
-            alg_params = {
-                'INPUT': outputs['Reamostrado']['OUTPUT'],
-                'BAND': 1,
-                'FIELD': 'DN',
-                'EIGHT_CONNECTEDNESS': False,
-                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-            }
-            outputs['Vetorizar'] = processing.run(
-                'gdal:polygonize', alg_params,
-                context=context, feedback=feedback, is_child_algorithm=True)
+            poly_path = os.path.join(tmp_dir, 'polygons.gpkg')
+            self._polygonize_raster(outputs['Reamostrado']['OUTPUT'], poly_path, feedback)
+            outputs['Vetorizar'] = {'OUTPUT': poly_path}
         except Exception as e:
             feedback.reportError(f'Erro na poligonização: {e}', fatalError=True)
             return {}
@@ -355,7 +310,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         try:
             alg_params = {
                 'FIELD': 'DN',
-                'INPUT': outputs['Vetorizar']['OUTPUT'],
+                'INPUT': poly_path,
                 'OPERATOR': 0,
                 'VALUE': '1',
                 'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
@@ -423,11 +378,11 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         try:
             alg_params = {
                 'INPUT': parameters[self.INPUT_LINES],
-                'MASK': outputs['BufferContorno']['OUTPUT'],
+                'OVERLAY': outputs['BufferContorno']['OUTPUT'],
                 'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
             }
             outputs['LinhasNoTalhao'] = processing.run(
-                'gdal:clipvectorbypolygon', alg_params,
+                'native:clip', alg_params,
                 context=context, feedback=feedback, is_child_algorithm=True)
         except Exception as e:
             feedback.reportError(f'Erro ao recortar linhas: {e}', fatalError=True)
@@ -536,6 +491,156 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
 
         logger.info('Análise de falha de plantio concluída com sucesso.')
         return results
+
+    def _clip_raster_by_mask(self, raster_path, mask_layer_ref, output_path, context, feedback):
+        src_ds = gdal.Open(raster_path)
+        if src_ds is None:
+            raise RuntimeError(f'Não foi possível abrir o raster: {raster_path}')
+
+        mask_gpkg = os.path.join(os.path.dirname(output_path), 'clip_mask.gpkg')
+        processing.run('native:savefeatures', {
+            'INPUT': mask_layer_ref,
+            'OUTPUT': mask_gpkg,
+        }, context=context, feedback=feedback, is_child_algorithm=True)
+
+        src_srs = src_ds.GetProjection()
+
+        warp_kwargs = {
+            'format': 'GTiff',
+            'cutlineDSName': mask_gpkg,
+            'cutlineLayer': 'clip_mask',
+            'cropToCutline': True,
+            'dstNodata': 0,
+        }
+        if src_srs:
+            warp_kwargs['srcSRS'] = src_srs
+            warp_kwargs['dstSRS'] = src_srs
+
+        warp_options = gdal.WarpOptions(**warp_kwargs)
+
+        result = gdal.Warp(output_path, src_ds, options=warp_options)
+        if result is None:
+            raise RuntimeError('gdal.Warp falhou ao recortar o raster')
+        result.FlushCache()
+        result = None
+        src_ds = None
+        feedback.pushInfo(f'Raster recortado salvo em: {output_path}')
+
+    def _calc_vegetation_index(self, raster_path, output_path, indice, banda_nir, feedback):
+        ds = gdal.Open(raster_path)
+        if ds is None:
+            raise RuntimeError(f'Não foi possível abrir: {raster_path}')
+
+        if indice == 0:
+            feedback.pushInfo('Calculando GLI (RGB)...')
+            red = ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
+            green = ds.GetRasterBand(2).ReadAsArray().astype(np.float32)
+            blue = ds.GetRasterBand(3).ReadAsArray().astype(np.float32)
+            result = (2.0 * green - red - blue) / (2.0 * green + red + blue + 0.0001)
+        else:
+            feedback.pushInfo(f'Calculando NDVI (NIR=banda {banda_nir})...')
+            red = ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
+            nir = ds.GetRasterBand(banda_nir).ReadAsArray().astype(np.float32)
+            result = (nir - red) / (nir + red + 0.0001)
+
+        driver = gdal.GetDriverByName('GTiff')
+        out_ds = driver.Create(
+            output_path, ds.RasterXSize, ds.RasterYSize, 1, gdal.GDT_Float32)
+        out_ds.SetGeoTransform(ds.GetGeoTransform())
+        out_ds.SetProjection(ds.GetProjection())
+        out_ds.GetRasterBand(1).WriteArray(result)
+        out_ds.GetRasterBand(1).SetNoDataValue(-9999)
+        out_ds.FlushCache()
+        out_ds = None
+        ds = None
+
+    def _calc_binary_mask(self, raster_path, output_path, threshold, feedback):
+        ds = gdal.Open(raster_path)
+        if ds is None:
+            raise RuntimeError(f'Não foi possível abrir: {raster_path}')
+
+        band_data = ds.GetRasterBand(1).ReadAsArray()
+        mask = (band_data > threshold).astype(np.uint8)
+
+        driver = gdal.GetDriverByName('GTiff')
+        out_ds = driver.Create(
+            output_path, ds.RasterXSize, ds.RasterYSize, 1, gdal.GDT_Byte)
+        out_ds.SetGeoTransform(ds.GetGeoTransform())
+        out_ds.SetProjection(ds.GetProjection())
+        out_ds.GetRasterBand(1).WriteArray(mask)
+        out_ds.GetRasterBand(1).SetNoDataValue(255)
+        out_ds.FlushCache()
+        out_ds = None
+        ds = None
+
+    def _apply_sieve(self, raster_path, output_path, threshold, feedback):
+        src_ds = gdal.Open(raster_path)
+        if src_ds is None:
+            raise RuntimeError(f'Não foi possível abrir: {raster_path}')
+
+        driver = gdal.GetDriverByName('GTiff')
+        dst_ds = driver.CreateCopy(output_path, src_ds)
+        src_band = src_ds.GetRasterBand(1)
+        dst_band = dst_ds.GetRasterBand(1)
+
+        gdal.SieveFilter(src_band, None, dst_band, threshold, 4)
+        dst_ds.FlushCache()
+        dst_ds = None
+        src_ds = None
+        feedback.pushInfo(f'Sieve filter aplicado (threshold={threshold})')
+
+    def _resample_raster(self, raster_path, output_path, target_res, feedback):
+        src_ds = gdal.Open(raster_path)
+        if src_ds is None:
+            raise RuntimeError(f'Não foi possível abrir: {raster_path}')
+
+        src_srs = src_ds.GetProjection()
+
+        warp_kwargs = {
+            'format': 'GTiff',
+            'xRes': target_res,
+            'yRes': target_res,
+            'resampleAlg': 'near',
+            'outputType': gdal.GDT_Byte,
+        }
+        if src_srs:
+            warp_kwargs['srcSRS'] = src_srs
+            warp_kwargs['dstSRS'] = src_srs
+
+        warp_options = gdal.WarpOptions(**warp_kwargs)
+
+        result = gdal.Warp(output_path, src_ds, options=warp_options)
+        if result is None:
+            raise RuntimeError('gdal.Warp falhou na reamostragem')
+        result.FlushCache()
+        result = None
+        src_ds = None
+        feedback.pushInfo(f'Reamostrado para {target_res}m')
+
+    def _polygonize_raster(self, raster_path, output_path, feedback):
+        src_ds = gdal.Open(raster_path)
+        if src_ds is None:
+            raise RuntimeError(f'Não foi possível abrir: {raster_path}')
+
+        src_band = src_ds.GetRasterBand(1)
+        src_srs = osr.SpatialReference()
+        src_srs.ImportFromWkt(src_ds.GetProjection())
+
+        drv = ogr.GetDriverByName('GPKG')
+        if os.path.exists(output_path):
+            drv.DeleteDataSource(output_path)
+        dst_ds = drv.CreateDataSource(output_path)
+        dst_layer = dst_ds.CreateLayer('polygons', srs=src_srs, geom_type=ogr.wkbPolygon)
+
+        fd = ogr.FieldDefn('DN', ogr.OFTInteger)
+        dst_layer.CreateField(fd)
+
+        gdal.Polygonize(src_band, None, dst_layer, 0, [], callback=None)
+
+        dst_ds.FlushCache()
+        dst_ds = None
+        src_ds = None
+        feedback.pushInfo(f'Poligonização concluída: {output_path}')
 
     def _calcular_estatisticas(self, falhas_output, linhas_output, context, feedback):
 
