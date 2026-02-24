@@ -513,49 +513,56 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo('Calculando GLI (RGB)...')
             # GLI = (2*G - R - B) / (2*G + R + B)
             # Bandas usuais RGB: 1=Red, 2=Green, 3=Blue
-            expression = '(2.0 * "A@2" - "A@1" - "A@3") / (2.0 * "A@2" + "A@1" + "A@3" + 0.0001)'
+            alg_params = {
+                'INPUT_A': raster_path,
+                'BAND_A': 1,
+                'INPUT_B': raster_path,
+                'BAND_B': 2,
+                'INPUT_C': raster_path,
+                'BAND_C': 3,
+                'FORMULA': '(2.0 * B - 1.0 * A - 1.0 * C) / (2.0 * B + 1.0 * A + 1.0 * C + 0.0001)',
+                'RTYPE': 5, # Float32
+                'OUTPUT': output_path,
+            }
         else:
             feedback.pushInfo(f'Calculando NDVI (NIR=banda {banda_nir})...')
             # NDVI = (NIR - R) / (NIR + R)
-            expression = f'("A@{banda_nir}" - "A@1") / ("A@{banda_nir}" + "A@1" + 0.0001)'
+            alg_params = {
+                'INPUT_A': raster_path,
+                'BAND_A': 1,
+                'INPUT_B': raster_path,
+                'BAND_B': banda_nir,
+                'FORMULA': '(1.0 * B - 1.0 * A) / (1.0 * B + 1.0 * A + 0.0001)',
+                'RTYPE': 5, # Float32
+                'OUTPUT': output_path,
+            }
 
-        alg_params = {
-            'EXPRESSION': expression,
-            'LAYERS': [raster_path],
-            'CELLSIZE': 0,
-            'EXTENT': None,
-            'CRS': None,
-            'OUTPUT': output_path,
-        }
         try:
-            processing.run('native:rastercalculator', alg_params,
+            processing.run('gdal:rastercalculator', alg_params,
                            context=context, feedback=feedback, is_child_algorithm=True)
         except Exception as e:
-            raise RuntimeError(f'native:rastercalculator (vegetation index) falhou: {e}')
+            raise RuntimeError(f'gdal:rastercalculator (vegetation index) falhou: {e}')
 
         if not os.path.exists(output_path):
-            raise RuntimeError('Falha ao gerar o índice de vegetação via rastercalculator')
+            raise RuntimeError('Falha ao gerar o índice de vegetação via gdal:rastercalculator')
 
     def _calc_binary_mask(self, raster_path, output_path, threshold, context, feedback):
         # Limiarização: Retorna 1 se > threshold, senão 0
-        expression = f'("A@1" > {threshold}) * 1'
-        
         alg_params = {
-            'EXPRESSION': expression,
-            'LAYERS': [raster_path],
-            'CELLSIZE': 0,
-            'EXTENT': None,
-            'CRS': None,
+            'INPUT_A': raster_path,
+            'BAND_A': 1,
+            'FORMULA': f'1 * (A > {threshold})',
+            'RTYPE': 0, # Byte
             'OUTPUT': output_path,
         }
         try:
-            processing.run('native:rastercalculator', alg_params,
+            processing.run('gdal:rastercalculator', alg_params,
                            context=context, feedback=feedback, is_child_algorithm=True)
         except Exception as e:
-            raise RuntimeError(f'native:rastercalculator (binary mask) falhou: {e}')
+            raise RuntimeError(f'gdal:rastercalculator (binary mask) falhou: {e}')
 
         if not os.path.exists(output_path):
-            raise RuntimeError('Falha ao gerar a máscara binária via rastercalculator')
+            raise RuntimeError('Falha ao gerar a máscara binária via gdal:rastercalculator')
 
     def _apply_sieve(self, raster_path, output_path, threshold, context, feedback):
         alg_params = {
