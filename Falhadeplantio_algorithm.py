@@ -221,7 +221,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         try:
             indice_path = os.path.join(tmp_dir, 'indice.tif')
             self._calc_vegetation_index(
-                clipped_path, indice_path, indice, banda_nir, feedback)
+                clipped_path, indice_path, indice, banda_nir, context, feedback)
             outputs['CalculoIndice'] = {'OUTPUT': indice_path}
         except Exception as e:
             feedback.reportError(f'Erro no índice de vegetação: {e}', fatalError=True)
@@ -236,7 +236,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             f'(threshold={threshold})...')
         try:
             mask_path = os.path.join(tmp_dir, 'mask.tif')
-            self._calc_binary_mask(indice_path, mask_path, threshold, feedback)
+            self._calc_binary_mask(indice_path, mask_path, threshold, context, feedback)
             outputs['MascaraBinaria'] = {'OUTPUT': mask_path}
         except Exception as e:
             feedback.reportError(f'Erro na máscara de vegetação: {e}', fatalError=True)
@@ -252,7 +252,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
                 f'(removendo grupos < {sieve_size} pixels)...')
             try:
                 sieved_path = os.path.join(tmp_dir, 'sieved.tif')
-                self._apply_sieve(mask_path, sieved_path, sieve_size, feedback)
+                self._apply_sieve(mask_path, sieved_path, sieve_size, context, feedback)
                 outputs['SieveFiltrado'] = {'OUTPUT': sieved_path}
             except Exception as e:
                 feedback.reportError(f'Erro no sieve filter: {e}', fatalError=True)
@@ -273,7 +273,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
                 f'{resolucao}m de resolução...')
             try:
                 resampled_path = os.path.join(tmp_dir, 'resampled.tif')
-                self._resample_raster(current_raster, resampled_path, resolucao, feedback)
+                self._resample_raster(current_raster, resampled_path, resolucao, context, feedback)
                 outputs['Reamostrado'] = {'OUTPUT': resampled_path}
             except Exception as e:
                 feedback.reportError(f'Erro na reamostragem: {e}', fatalError=True)
@@ -291,7 +291,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             f'Passo {step}/{self.TOTAL_STEPS}: Convertendo raster em polígonos...')
         try:
             poly_path = os.path.join(tmp_dir, 'polygons.gpkg')
-            self._polygonize_raster(outputs['Reamostrado']['OUTPUT'], poly_path, feedback)
+            self._polygonize_raster(outputs['Reamostrado']['OUTPUT'], poly_path, context, feedback)
             outputs['Vetorizar'] = {'OUTPUT': poly_path}
         except Exception as e:
             feedback.reportError(f'Erro na poligonização: {e}', fatalError=True)
@@ -494,7 +494,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             'MASK': mask_layer_ref,
             'CROP_TO_CUTLINE': True,
             'KEEP_RESOLUTION': True,
-            'NODATA': 0,
+            'NODATA': None,
             'OUTPUT': output_path,
         }
         try:
@@ -508,7 +508,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             
         feedback.pushInfo(f'Raster recortado salvo em: {output_path}')
 
-    def _calc_vegetation_index(self, raster_path, output_path, indice, banda_nir, feedback):
+    def _calc_vegetation_index(self, raster_path, output_path, indice, banda_nir, context, feedback):
         if indice == 0:
             feedback.pushInfo('Calculando GLI (RGB)...')
             # GLI = (2*G - R - B) / (2*G + R + B)
@@ -536,7 +536,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         if not os.path.exists(output_path):
             raise RuntimeError('Falha ao gerar o índice de vegetação via rastercalculator')
 
-    def _calc_binary_mask(self, raster_path, output_path, threshold, feedback):
+    def _calc_binary_mask(self, raster_path, output_path, threshold, context, feedback):
         # Limiarização: Retorna 1 se > threshold, senão 0
         expression = f'("A@1" > {threshold}) * 1'
         
@@ -557,7 +557,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         if not os.path.exists(output_path):
             raise RuntimeError('Falha ao gerar a máscara binária via rastercalculator')
 
-    def _apply_sieve(self, raster_path, output_path, threshold, feedback):
+    def _apply_sieve(self, raster_path, output_path, threshold, context, feedback):
         alg_params = {
             'INPUT': raster_path,
             'THRESHOLD': threshold,
@@ -578,7 +578,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             
         feedback.pushInfo(f'Sieve filter aplicado (threshold={threshold})')
 
-    def _resample_raster(self, raster_path, output_path, target_res, feedback):
+    def _resample_raster(self, raster_path, output_path, target_res, context, feedback):
         alg_params = {
             'INPUT': raster_path,
             'SOURCE_CRS': None,
@@ -605,7 +605,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             
         feedback.pushInfo(f'Reamostrado para {target_res}m')
 
-    def _polygonize_raster(self, raster_path, output_path, feedback):
+    def _polygonize_raster(self, raster_path, output_path, context, feedback):
         alg_params = {
             'INPUT': raster_path,
             'BAND': 1,
