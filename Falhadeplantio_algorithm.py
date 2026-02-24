@@ -6,8 +6,6 @@ __copyright__ = '(C) 2026 CainC0de'
 import logging
 import os
 import tempfile
-import numpy as np
-from osgeo import gdal, ogr, osr, gdal_array
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
@@ -26,8 +24,6 @@ import processing
 from qgis.PyQt.QtGui import QIcon
 
 logger = logging.getLogger('FalhaDePlantio')
-
-gdal.UseExceptions()
 
 
 class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
@@ -493,153 +489,140 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         return results
 
     def _clip_raster_by_mask(self, raster_path, mask_layer_ref, output_path, context, feedback):
-        src_ds = gdal.Open(raster_path)
-        if src_ds is None:
-            raise RuntimeError(f'Não foi possível abrir o raster: {raster_path}')
-
-        mask_gpkg = os.path.join(os.path.dirname(output_path), 'clip_mask.gpkg')
-        processing.run('native:savefeatures', {
-            'INPUT': mask_layer_ref,
-            'OUTPUT': mask_gpkg,
-        }, context=context, feedback=feedback, is_child_algorithm=True)
-
-        src_srs = src_ds.GetProjection()
-
-        warp_kwargs = {
-            'format': 'GTiff',
-            'cutlineDSName': mask_gpkg,
-            'cutlineLayer': 'clip_mask',
-            'cropToCutline': True,
-            'dstNodata': 0,
+        alg_params = {
+            'INPUT': raster_path,
+            'MASK': mask_layer_ref,
+            'CROP_TO_CUTLINE': True,
+            'KEEP_RESOLUTION': True,
+            'NODATA': 0,
+            'OUTPUT': output_path,
         }
-        if src_srs:
-            warp_kwargs['srcSRS'] = src_srs
-            warp_kwargs['dstSRS'] = src_srs
-
-        warp_options = gdal.WarpOptions(**warp_kwargs)
-
-        result = gdal.Warp(output_path, src_ds, options=warp_options)
-        if result is None:
-            raise RuntimeError('gdal.Warp falhou ao recortar o raster')
-        result.FlushCache()
-        result = None
-        src_ds = None
+        try:
+            processing.run('gdal:cliprasterbymasklayer', alg_params,
+                           context=context, feedback=feedback, is_child_algorithm=True)
+        except Exception as e:
+            raise RuntimeError(f'gdal:cliprasterbymasklayer falhou: {e}')
+            
+        if not os.path.exists(output_path):
+            raise RuntimeError('gdal:cliprasterbymasklayer não gerou o output esperado')
+            
         feedback.pushInfo(f'Raster recortado salvo em: {output_path}')
 
     def _calc_vegetation_index(self, raster_path, output_path, indice, banda_nir, feedback):
-        ds = gdal.Open(raster_path)
-        if ds is None:
-            raise RuntimeError(f'Não foi possível abrir: {raster_path}')
-
         if indice == 0:
             feedback.pushInfo('Calculando GLI (RGB)...')
-            red = ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
-            green = ds.GetRasterBand(2).ReadAsArray().astype(np.float32)
-            blue = ds.GetRasterBand(3).ReadAsArray().astype(np.float32)
-            result = (2.0 * green - red - blue) / (2.0 * green + red + blue + 0.0001)
+            # GLI = (2*G - R - B) / (2*G + R + B)
+            # Bandas usuais RGB: 1=Red, 2=Green, 3=Blue
+            expression = '(2.0 * "A@2" - "A@1" - "A@3") / (2.0 * "A@2" + "A@1" + "A@3" + 0.0001)'
         else:
             feedback.pushInfo(f'Calculando NDVI (NIR=banda {banda_nir})...')
-            red = ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
-            nir = ds.GetRasterBand(banda_nir).ReadAsArray().astype(np.float32)
-            result = (nir - red) / (nir + red + 0.0001)
+            # NDVI = (NIR - R) / (NIR + R)
+            expression = f'("A@{banda_nir}" - "A@1") / ("A@{banda_nir}" + "A@1" + 0.0001)'
 
-        driver = gdal.GetDriverByName('GTiff')
-        out_ds = driver.Create(
-            output_path, ds.RasterXSize, ds.RasterYSize, 1, gdal.GDT_Float32)
-        out_ds.SetGeoTransform(ds.GetGeoTransform())
-        out_ds.SetProjection(ds.GetProjection())
-        out_ds.GetRasterBand(1).WriteArray(result)
-        out_ds.GetRasterBand(1).SetNoDataValue(-9999)
-        out_ds.FlushCache()
-        out_ds = None
-        ds = None
+        alg_params = {
+            'EXPRESSION': expression,
+            'LAYERS': [raster_path],
+            'CELLSIZE': 0,
+            'EXTENT': None,
+            'CRS': None,
+            'OUTPUT': output_path,
+        }
+        try:
+            processing.run('native:rastercalculator', alg_params,
+                           context=context, feedback=feedback, is_child_algorithm=True)
+        except Exception as e:
+            raise RuntimeError(f'native:rastercalculator (vegetation index) falhou: {e}')
+
+        if not os.path.exists(output_path):
+            raise RuntimeError('Falha ao gerar o índice de vegetação via rastercalculator')
 
     def _calc_binary_mask(self, raster_path, output_path, threshold, feedback):
-        ds = gdal.Open(raster_path)
-        if ds is None:
-            raise RuntimeError(f'Não foi possível abrir: {raster_path}')
+        # Limiarização: Retorna 1 se > threshold, senão 0
+        expression = f'("A@1" > {threshold}) * 1'
+        
+        alg_params = {
+            'EXPRESSION': expression,
+            'LAYERS': [raster_path],
+            'CELLSIZE': 0,
+            'EXTENT': None,
+            'CRS': None,
+            'OUTPUT': output_path,
+        }
+        try:
+            processing.run('native:rastercalculator', alg_params,
+                           context=context, feedback=feedback, is_child_algorithm=True)
+        except Exception as e:
+            raise RuntimeError(f'native:rastercalculator (binary mask) falhou: {e}')
 
-        band_data = ds.GetRasterBand(1).ReadAsArray()
-        mask = (band_data > threshold).astype(np.uint8)
-
-        driver = gdal.GetDriverByName('GTiff')
-        out_ds = driver.Create(
-            output_path, ds.RasterXSize, ds.RasterYSize, 1, gdal.GDT_Byte)
-        out_ds.SetGeoTransform(ds.GetGeoTransform())
-        out_ds.SetProjection(ds.GetProjection())
-        out_ds.GetRasterBand(1).WriteArray(mask)
-        out_ds.GetRasterBand(1).SetNoDataValue(255)
-        out_ds.FlushCache()
-        out_ds = None
-        ds = None
+        if not os.path.exists(output_path):
+            raise RuntimeError('Falha ao gerar a máscara binária via rastercalculator')
 
     def _apply_sieve(self, raster_path, output_path, threshold, feedback):
-        src_ds = gdal.Open(raster_path)
-        if src_ds is None:
-            raise RuntimeError(f'Não foi possível abrir: {raster_path}')
+        alg_params = {
+            'INPUT': raster_path,
+            'THRESHOLD': threshold,
+            'EIGHT_CONNECTEDNESS': False,
+            'NO_MASK': False,
+            'MASK_LAYER': None,
+            'EXTRA': '',
+            'OUTPUT': output_path,
+        }
+        try:
+            processing.run('gdal:sieve', alg_params,
+                           context=context, feedback=feedback, is_child_algorithm=True)
+        except Exception as e:
+            raise RuntimeError(f'gdal:sieve falhou: {e}')
 
-        driver = gdal.GetDriverByName('GTiff')
-        dst_ds = driver.CreateCopy(output_path, src_ds)
-        src_band = src_ds.GetRasterBand(1)
-        dst_band = dst_ds.GetRasterBand(1)
-
-        gdal.SieveFilter(src_band, None, dst_band, threshold, 4)
-        dst_ds.FlushCache()
-        dst_ds = None
-        src_ds = None
+        if not os.path.exists(output_path):
+            raise RuntimeError('Falha ao aplicar o filtro sieve')
+            
         feedback.pushInfo(f'Sieve filter aplicado (threshold={threshold})')
 
     def _resample_raster(self, raster_path, output_path, target_res, feedback):
-        src_ds = gdal.Open(raster_path)
-        if src_ds is None:
-            raise RuntimeError(f'Não foi possível abrir: {raster_path}')
-
-        src_srs = src_ds.GetProjection()
-
-        warp_kwargs = {
-            'format': 'GTiff',
-            'xRes': target_res,
-            'yRes': target_res,
-            'resampleAlg': 'near',
-            'outputType': gdal.GDT_Byte,
+        alg_params = {
+            'INPUT': raster_path,
+            'SOURCE_CRS': None,
+            'TARGET_CRS': None,
+            'RESAMPLING': 0, # Nearest Neighbour
+            'NODATA': None,
+            'TARGET_RESOLUTION': target_res,
+            'OPTIONS': '',
+            'DATA_TYPE': 0, # Use Input Layer Data Type
+            'TARGET_EXTENT': None,
+            'TARGET_EXTENT_CRS': None,
+            'MULTITHREADING': False,
+            'EXTRA': '',
+            'OUTPUT': output_path,
         }
-        if src_srs:
-            warp_kwargs['srcSRS'] = src_srs
-            warp_kwargs['dstSRS'] = src_srs
+        try:
+            processing.run('gdal:warpresolution', alg_params,
+                           context=context, feedback=feedback, is_child_algorithm=True)
+        except Exception as e:
+            raise RuntimeError(f'gdal:warpresolution falhou na reamostragem: {e}')
 
-        warp_options = gdal.WarpOptions(**warp_kwargs)
-
-        result = gdal.Warp(output_path, src_ds, options=warp_options)
-        if result is None:
-            raise RuntimeError('gdal.Warp falhou na reamostragem')
-        result.FlushCache()
-        result = None
-        src_ds = None
+        if not os.path.exists(output_path):
+            raise RuntimeError('Falha ao reamostrar o raster')
+            
         feedback.pushInfo(f'Reamostrado para {target_res}m')
 
     def _polygonize_raster(self, raster_path, output_path, feedback):
-        src_ds = gdal.Open(raster_path)
-        if src_ds is None:
-            raise RuntimeError(f'Não foi possível abrir: {raster_path}')
+        alg_params = {
+            'INPUT': raster_path,
+            'BAND': 1,
+            'FIELD': 'DN',
+            'EIGHT_CONNECTEDNESS': False,
+            'EXTRA': '',
+            'OUTPUT': output_path,
+        }
+        try:
+            processing.run('gdal:polygonize', alg_params,
+                           context=context, feedback=feedback, is_child_algorithm=True)
+        except Exception as e:
+            raise RuntimeError(f'gdal:polygonize falhou: {e}')
 
-        src_band = src_ds.GetRasterBand(1)
-        src_srs = osr.SpatialReference()
-        src_srs.ImportFromWkt(src_ds.GetProjection())
-
-        drv = ogr.GetDriverByName('GPKG')
-        if os.path.exists(output_path):
-            drv.DeleteDataSource(output_path)
-        dst_ds = drv.CreateDataSource(output_path)
-        dst_layer = dst_ds.CreateLayer('polygons', srs=src_srs, geom_type=ogr.wkbPolygon)
-
-        fd = ogr.FieldDefn('DN', ogr.OFTInteger)
-        dst_layer.CreateField(fd)
-
-        gdal.Polygonize(src_band, None, dst_layer, 0, [], callback=None)
-
-        dst_ds.FlushCache()
-        dst_ds = None
-        src_ds = None
+        if not os.path.exists(output_path):
+            raise RuntimeError('Falha ao poligonizar o raster')
+            
         feedback.pushInfo(f'Poligonização concluída: {output_path}')
 
     def _calcular_estatisticas(self, falhas_output, linhas_output, context, feedback):
