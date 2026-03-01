@@ -163,6 +163,6 @@ Veja o arquivo de licença para mais detalhes.
 
 ## 👤 Autor
 
-**CainC0de** — [@CainC0de](https://github.com/CainC0de)
+**Guilherme Barbosa** — [@CainC0de](https://github.com/CainC0de)
 
 Apoie a comunidade open source! 🌱
