@@ -1,4 +1,4 @@
-# coding=utf-8
+
 """QGIS plugin implementation.
 
 .. note:: This program is free software; you can redistribute it and/or modify
