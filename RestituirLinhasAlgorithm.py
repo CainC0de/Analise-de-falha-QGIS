@@ -18,6 +18,7 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsProcessingParameterRasterLayer,
     QgsProcessingParameterVectorLayer,
+    QgsCoordinateTransform,
     QgsFeatureSink,
     QgsUnitTypes,
     QgsWkbTypes,
@@ -80,19 +81,29 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException('Selecione a imagem raster usada na análise.')
         if points is None or not points.isValid():
             raise QgsProcessingException('Selecione a nuvem de pontos da cultura.')
-        crs = raster.crs()
+        if not raster.crs().isValid():
+            raise QgsProcessingException('A imagem de referência não tem um CRS válido.')
+        crs = points.crs()
         if not crs.isValid() or crs.isGeographic():
             raise QgsProcessingException(
-                'A imagem deve usar um CRS projetado com unidades métricas.'
+                'A nuvem de pontos precisa estar em um CRS projetado.'
             )
         if crs.mapUnits() != QgsUnitTypes.DistanceMeters:
             raise QgsProcessingException(
-                'A imagem deve usar um CRS projetado em metros para aplicar o '
-                'espaçamento e as tolerâncias da restituição.'
+                'A nuvem de pontos precisa usar um CRS projetado em metros.'
             )
-        if points.crs() != crs:
+        try:
+            transform = QgsCoordinateTransform(
+                raster.crs(), crs, context.transformContext()
+            )
+            image_extent = transform.transformBoundingBox(raster.extent())
+        except Exception as exc:
             raise QgsProcessingException(
-                'A nuvem de pontos e a imagem precisam estar no mesmo CRS.'
+                f'Não foi possível alinhar a imagem e a nuvem de pontos: {exc}'
+            )
+        if not image_extent.intersects(points.extent()):
+            raise QgsProcessingException(
+                'A nuvem de pontos não está dentro da área da imagem selecionada.'
             )
 
         spacing = self.parameterAsDouble(parameters, self.ROW_SPACING, context)
@@ -248,14 +259,22 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             profile = np.histogram(
                 projection, bins=size, range=(start, start + size * bin_size)
             )[0].astype(np.float64)
-            centered = profile - profile.mean()
+            smooth_width = max(1, int(round(0.30 / bin_size)))
+            smooth_kernel = np.ones(smooth_width, dtype=np.float64) / smooth_width
+            centered = np.convolve(profile, smooth_kernel, mode='same')
+            mean = float(centered.mean())
+            peakiness = float(centered.std() / (mean + 1e-9))
+            centered -= mean
             energy = float(np.dot(centered, centered))
             if energy <= 0:
                 continue
+            periodicity = 0.0
             for lag in range(lag_min, min(lag_max, len(centered) - 1) + 1):
                 score = float(np.dot(centered[:-lag], centered[lag:]) / energy)
-                if score > best_score:
-                    best_score, best_angle = score, float(angle)
+                periodicity = max(periodicity, score)
+            score = peakiness * max(0.0, periodicity)
+            if score > best_score:
+                best_score, best_angle = score, float(angle)
         return best_angle
 
     def _projected_bounds(self, bounds, vector):
@@ -288,6 +307,10 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             and smoothed[index] > smoothed[index + 1]
             and smoothed[index] > 0
         ]
+        if smoothed[0] > smoothed[1] and smoothed[0] > 0:
+            local_maxima.append(0)
+        if smoothed[-1] > smoothed[-2] and smoothed[-1] > 0:
+            local_maxima.append(len(smoothed) - 1)
         if not local_maxima:
             return []
         peak_floor = max(float(smoothed.max()) * 0.08, float(np.median(smoothed)) * 1.15)
@@ -369,5 +392,6 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             'curvas independentes; o algoritmo não força todas a serem paralelas. '
             'A saída é uma camada vetorial de linhas no CRS da imagem.\n\n'
             'Ajuste o espaçamento esperado conforme o plantio. Os pontos precisam '
-            'estar no mesmo CRS projetado da imagem.'
+            'estar em CRS projetado em metros; a imagem pode estar em outro CRS '
+            'e será usada para conferir a área analisada.'
         )

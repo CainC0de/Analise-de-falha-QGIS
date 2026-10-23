@@ -29,8 +29,9 @@ um ponto no centro de cada pixel classificado como vegetação; o campo `gli`
 guarda o índice calculado e `classe` vale `1`.
 
 O tamanho do pixel define a resolução espacial de saída. Ele não cria detalhe
-que não exista na imagem original. O raster precisa ter um CRS projetado para
-que centímetros possam ser convertidos corretamente. Para imagens RGB, o GLI
+que não exista na imagem original. Se o raster estiver em graus ou em unidades
+não métricas, o plugin o reprojeta automaticamente para a zona UTM local para
+aplicar a resolução em centímetros. Para imagens RGB, o GLI
 detecta cobertura verde, mas não distingue cana-de-açúcar de ervas daninhas;
 essa distinção requer contexto adicional, como linhas de plantio, outras bandas
 espectrais ou uma etapa de classificação treinada.
@@ -46,8 +47,9 @@ o espaçamento das fileiras, agrupa os pontos por linha e cria uma camada
 vetorial com traçados ajustados localmente aos pontos. Cada linha é ajustada de
 forma independente para preservar pequenas curvas e variações observadas no
 campo. O espaçamento esperado (padrão: 1,5 m), a largura de associação dos
-pontos e o maior intervalo a interpolar podem ser ajustados. O resultado é uma
-camada de linhas no CRS métrico da imagem.
+pontos e o maior intervalo a interpolar podem ser ajustados. A imagem original
+pode estar em outro CRS; o algoritmo confere a sobreposição e grava as linhas
+no CRS métrico da nuvem de pontos.
 
 ## Instalação
 

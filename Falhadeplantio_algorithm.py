@@ -14,6 +14,8 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsProcessingParameterRasterDestination,
     QgsProcessingParameterRasterLayer,
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
     QgsFeature,
     QgsFeatureSink,
     QgsField,
@@ -79,27 +81,37 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException('Selecione um raster de entrada válido.')
 
         crs = raster.crs()
-        if not crs.isValid() or crs.isGeographic():
-            raise QgsProcessingException(
-                'O raster usa um CRS geográfico (graus). Reprojete-o para um CRS '
-                'projetado antes de definir o tamanho do pixel em centímetros.'
+        if not crs.isValid():
+            raise QgsProcessingException('O raster não tem um CRS válido definido.')
+        pixel_cm = self.parameterAsDouble(parameters, self.PIXEL_SIZE_CM, context)
+
+        output_crs = crs
+        reproject_to_utm = (
+            crs.isGeographic() or crs.mapUnits() != QgsUnitTypes.DistanceMeters
+        )
+        if reproject_to_utm:
+            output_crs = self._local_utm_crs(raster, crs, context)
+            pixel_size_map_units = pixel_cm / 100.0
+            feedback.pushInfo(
+                f'Raster em unidades não métricas: reprojetando automaticamente para '
+                f'{output_crs.authid()} com pixel de {pixel_cm:g} cm.'
+            )
+        else:
+            metres_per_map_unit = QgsUnitTypes.fromUnitToUnitFactor(
+                crs.mapUnits(), QgsUnitTypes.DistanceMeters)
+            if not metres_per_map_unit or not np.isfinite(metres_per_map_unit):
+                raise QgsProcessingException(
+                    'Não foi possível converter as unidades do CRS para metros.'
+                )
+            pixel_size_map_units = (
+                pixel_cm / 100.0 / metres_per_map_unit
             )
 
-        pixel_cm = self.parameterAsDouble(parameters, self.PIXEL_SIZE_CM, context)
         threshold = self.parameterAsDouble(parameters, self.GLI_THRESHOLD, context)
         red_band = self.parameterAsInt(parameters, self.RED_BAND, context)
         green_band = self.parameterAsInt(parameters, self.GREEN_BAND, context)
         blue_band = self.parameterAsInt(parameters, self.BLUE_BAND, context)
         output_path = self.parameterAsOutputLayer(parameters, self.OUTPUT, context)
-
-        # Convert the requested ground size to the units used by the projected CRS.
-        metres_per_map_unit = QgsUnitTypes.fromUnitToUnitFactor(
-            crs.mapUnits(), QgsUnitTypes.DistanceMeters)
-        if not metres_per_map_unit or not np.isfinite(metres_per_map_unit):
-            raise QgsProcessingException(
-                'Não foi possível converter as unidades do CRS para metros.'
-            )
-        pixel_size_map_units = (pixel_cm / 100.0) / metres_per_map_unit
 
         src = gdal.Open(raster.source(), gdal.GA_ReadOnly)
         if src is None:
@@ -135,14 +147,9 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             max(point[0] for point in corners),
             max(point[1] for point in corners),
         )
-        out_width = max(1, int(np.ceil((bounds[2] - bounds[0]) / pixel_size_map_units)))
-        out_height = max(1, int(np.ceil((bounds[3] - bounds[1]) / pixel_size_map_units)))
         src = None
 
-        feedback.pushInfo(
-            f'Resolução solicitada: {pixel_cm:g} cm; '
-            f'índice de saída aproximado: {out_width} × {out_height} pixels.'
-        )
+        feedback.pushInfo(f'Resolução solicitada: {pixel_cm:g} cm.')
         feedback.pushInfo(
             'O tamanho configurado define o espaçamento dos pixels no GeoTIFF; '
             'não cria detalhe além da resolução espacial original da imagem.'
@@ -166,19 +173,23 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             def warp_progress(_complete, _message, _data):
                 return 0 if feedback.isCanceled() else 1
 
+            warp_options = {
+                'format': 'GTiff',
+                'xRes': pixel_size_map_units,
+                'yRes': pixel_size_map_units,
+                'resampleAlg': 'bilinear',
+                'outputType': gdal.GDT_Float32,
+                'creationOptions': ['TILED=YES', 'COMPRESS=DEFLATE', 'BIGTIFF=IF_SAFER'],
+                'callback': warp_progress,
+            }
+            if reproject_to_utm:
+                warp_options['dstSRS'] = output_crs.toWkt()
+            else:
+                warp_options['outputBounds'] = bounds
             warped = gdal.Warp(
                 rgb_path,
                 vrt_path,
-                options=gdal.WarpOptions(
-                    format='GTiff',
-                    outputBounds=bounds,
-                    xRes=pixel_size_map_units,
-                    yRes=pixel_size_map_units,
-                    resampleAlg='bilinear',
-                    outputType=gdal.GDT_Float32,
-                    creationOptions=['TILED=YES', 'COMPRESS=DEFLATE', 'BIGTIFF=IF_SAFER'],
-                    callback=warp_progress,
-                ),
+                options=gdal.WarpOptions(**warp_options),
             )
             if warped is None:
                 if feedback.isCanceled():
@@ -191,6 +202,10 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             rgb = gdal.Open(rgb_path, gdal.GA_ReadOnly)
             out_width = rgb.RasterXSize
             out_height = rgb.RasterYSize
+            feedback.pushInfo(
+                f'Grade de saída: {out_width} × {out_height} pixels em '
+                f'{output_crs.authid()}.'
+            )
             driver = gdal.GetDriverByName('GTiff')
             result = driver.Create(
                 output_path, out_width, out_height, 1, gdal.GDT_Byte,
@@ -225,7 +240,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
                 context,
                 point_fields,
                 QgsWkbTypes.Point,
-                crs,
+                output_crs,
             )
             if point_sink is None:
                 result = None
@@ -326,7 +341,8 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             'limiar GLI e o tamanho de pixel de saída em centímetros. O algoritmo '
             'grava a classificação em GeoTIFF e cria uma camada de pontos GeoPackage '
             'com um ponto no centro de cada pixel verde classificado. O raster precisa '
-            'usar um CRS projetado.\n\n'
+            'usar um CRS definido. Se estiver em graus ou unidades não métricas, '
+            'a saída será reprojetada automaticamente para a zona UTM local.\n\n'
             'A resolução de saída define o espaçamento dos pixels e não aumenta o '
             'detalhe real da imagem. Esta etapa detecta cobertura verde em RGB; '
             'ela não distingue cana de plantas daninhas sem linhas de plantio, '
@@ -336,3 +352,30 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
 
     def helpUrl(self):
         return 'https://github.com/CainC0de/Analise-de-falha-QGIS'
+
+    def _local_utm_crs(self, raster, source_crs, context):
+        """Choose the UTM zone at the raster center and return its CRS."""
+        wgs84 = QgsCoordinateReferenceSystem('EPSG:4326')
+        transform = QgsCoordinateTransform(
+            source_crs, wgs84, context.transformContext()
+        )
+        try:
+            center = transform.transform(raster.extent().center())
+        except Exception as exc:
+            raise QgsProcessingException(
+                f'Não foi possível localizar a zona UTM da imagem: {exc}'
+            )
+        longitude, latitude = center.x(), center.y()
+        if not (-180 <= longitude <= 180 and -80 <= latitude <= 84):
+            raise QgsProcessingException(
+                'A imagem está fora da área de cobertura UTM automática '
+                '(latitude entre 80°S e 84°N).'
+            )
+        zone = min(60, max(1, int((longitude + 180) // 6) + 1))
+        epsg = (32700 if latitude < 0 else 32600) + zone
+        target = QgsCoordinateReferenceSystem(f'EPSG:{epsg}')
+        if not target.isValid():
+            raise QgsProcessingException(
+                f'Não foi possível criar o CRS UTM EPSG:{epsg}.'
+            )
+        return target
