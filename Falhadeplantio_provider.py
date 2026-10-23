@@ -7,6 +7,7 @@ import os
 from qgis.core import QgsProcessingProvider
 from qgis.PyQt.QtGui import QIcon
 from .Falhadeplantio_algorithm import FalhaDePlantioAlgorithm
+from .RestituirLinhasAlgorithm import RestituirLinhasAlgorithm
 
 
 class FalhaDePlantioProvider(QgsProcessingProvider):
@@ -19,6 +20,7 @@ class FalhaDePlantioProvider(QgsProcessingProvider):
 
     def loadAlgorithms(self):
         self.addAlgorithm(FalhaDePlantioAlgorithm())
+        self.addAlgorithm(RestituirLinhasAlgorithm())
 
     def id(self):
         return 'falhadeplantio'
@@ -31,4 +33,4 @@ class FalhaDePlantioProvider(QgsProcessingProvider):
         return QIcon(icon_path)
 
     def longName(self):
-        return self.tr('Falha de Plantio — Análise de cana-de-açúcar (v2.0)')
+        return self.tr('Falha de Plantio — Análise de cana-de-açúcar (v2.2)')

@@ -1,12 +1,12 @@
 [general]
 name=Falha de Plantio
 qgisMinimumVersion=3.22
-description=Plugin para mapeamento de falhas de plantio na cultura de cana-de-açúcar utilizando imagens RGB/NDVI de drone ou satélite. Suporta GLI e NDVI, com threshold configurável e estatísticas automáticas.
-version=2.0
+description=Classifica cobertura verde em imagens RGB, gera GeoTIFF e nuvem de pontos da cultura e restitui linhas de plantio.
+version=2.2
 author=CainC0de
 email=
 
-about=Ferramenta de análise geoespacial para detecção automática de falhas de plantio em cana-de-açúcar. Utiliza índices de vegetação (GLI ou NDVI) para comparar linhas de plantio com a cobertura vegetal real, identificando segmentos sem vegetação. Gera linhas de falha com comprimento em metros e estatísticas detalhadas (total, média, percentual de falha).
+about=Fluxo de análise de falhas: classifica cobertura verde em RGB por GLI, gera GeoTIFF e nuvem 2D de pontos GeoPackage nos pixels de cultura e restitui linhas de plantio a partir dos pontos.
 
 tracker=https://github.com/CainC0de/Analise-de-falha-QGIS/issues
 repository=https://github.com/CainC0de/Analise-de-falha-QGIS
@@ -14,12 +14,14 @@ repository=https://github.com/CainC0de/Analise-de-falha-QGIS
 hasProcessingProvider=yes
 
 changelog=
+    2.2 - Restituição adaptativa de linhas de plantio a partir da nuvem de pontos
+    2.1 - Classificação pixel a pixel por GLI, GeoTIFF e nuvem de pontos da cultura
     2.0 - Versão refatorada: suporte NDVI, threshold configurável, filtro de comprimento mínimo, estatísticas automáticas, tratamento de erros robusto, verificação de cancelamento
     1.0 - Versão estável
     0.2 - Correção de bugs
     0.1 - Lançamento da ferramenta
 
-tags=agriculture,sugarcane,cana,plantio,falha,failure,remote sensing,sensoriamento remoto,drone,vegetation index,GLI,NDVI,analysis
+tags=agriculture,sugarcane,cana,plantio,falha,failure,remote sensing,sensoriamento remoto,drone,vegetation index,GLI,RGB,analysis
 
 homepage=https://github.com/CainC0de/Analise-de-falha-QGIS
 category=Analysis

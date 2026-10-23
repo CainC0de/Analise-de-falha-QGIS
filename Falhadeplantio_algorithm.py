@@ -1,731 +1,337 @@
+"""Initial RGB vegetation classification algorithm for the QGIS plugin."""
 
-__author__ = 'CainC0de'
-__date__ = '2022-09-25'
-__copyright__ = '(C) 2026 CainC0de'
-
-import logging
 import os
 import tempfile
+
+import numpy as np
+from osgeo import gdal
+from qgis.PyQt.QtCore import QVariant
 from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
-    QgsProcessingMultiStepFeedback,
-    QgsProcessingParameterRasterLayer,
-    QgsProcessingParameterVectorLayer,
+    QgsProcessingException,
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterNumber,
-    QgsProcessingParameterEnum,
-    QgsProcessingParameterBoolean,
-    QgsProcessingOutputString,
-    QgsProject,
-    QgsRasterLayer,
+    QgsProcessingParameterRasterDestination,
+    QgsProcessingParameterRasterLayer,
+    QgsFeature,
+    QgsFeatureSink,
+    QgsField,
+    QgsFields,
+    QgsGeometry,
+    QgsPointXY,
+    QgsUnitTypes,
+    QgsWkbTypes,
 )
-import processing
-from qgis.PyQt.QtGui import QIcon
-
-logger = logging.getLogger('FalhaDePlantio')
 
 
 class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
-
-    INPUT_RASTER = 'gligreenleafindex'
-    INPUT_LINES = 'linhaplantio'
-    INPUT_POLYGON = 'quadra'
-    OUTPUT_FAILURES = 'FalhaDePlantio'
-    PARAM_INDEX = 'indice_vegetacao'
-    PARAM_THRESHOLD = 'threshold_gli'
-    PARAM_BUFFER = 'buffer_contorno'
-    PARAM_MIN_LENGTH = 'comp_minimo'
-    PARAM_NIR_BAND = 'banda_nir'
-    PARAM_SIEVE_SIZE = 'tamanho_sieve'
-    PARAM_ANALYSIS_RES = 'resolucao_analise'
-    PARAM_SIMPLIFY_TOL = 'simplificar_tolerancia'
-    OUTPUT_STATS = 'Estatisticas'
-
-    INDEX_CHOICES = ['GLI (RGB)', 'NDVI (NIR + Vermelho)']
-    TOTAL_STEPS = 16
+    INPUT_RASTER = 'INPUT_RASTER'
+    RED_BAND = 'RED_BAND'
+    GREEN_BAND = 'GREEN_BAND'
+    BLUE_BAND = 'BLUE_BAND'
+    PIXEL_SIZE_CM = 'PIXEL_SIZE_CM'
+    GLI_THRESHOLD = 'GLI_THRESHOLD'
+    OUTPUT = 'OUTPUT'
+    OUTPUT_POINTS = 'OUTPUT_POINTS'
 
     def initAlgorithm(self, config=None):
-
         self.addParameter(QgsProcessingParameterRasterLayer(
             self.INPUT_RASTER,
-            'Raster (Drone/Imagem)',
-            defaultValue=None,
+            'Raster de entrada (imagem RGB)',
         ))
-
-        self.addParameter(QgsProcessingParameterVectorLayer(
-            self.INPUT_LINES,
-            'Linhas de Plantio',
-            types=[QgsProcessing.TypeVectorLine],
-            defaultValue=None,
-        ))
-
-        self.addParameter(QgsProcessingParameterVectorLayer(
-            self.INPUT_POLYGON,
-            'Contorno do Talhão',
-            types=[QgsProcessing.TypeVectorPolygon],
-            defaultValue=None,
-        ))
-
-        self.addParameter(QgsProcessingParameterEnum(
-            self.PARAM_INDEX,
-            'Índice de Vegetação',
-            options=self.INDEX_CHOICES,
-            defaultValue=0,
-        ))
-
+        for key, label, default in (
+                (self.RED_BAND, 'Banda vermelha (R)', 1),
+                (self.GREEN_BAND, 'Banda verde (G)', 2),
+                (self.BLUE_BAND, 'Banda azul (B)', 3)):
+            self.addParameter(QgsProcessingParameterNumber(
+                key, label, type=QgsProcessingParameterNumber.Integer,
+                defaultValue=default, minValue=1,
+            ))
         self.addParameter(QgsProcessingParameterNumber(
-            self.PARAM_THRESHOLD,
-            'Limiar de Vegetação (threshold do índice)',
+            self.PIXEL_SIZE_CM,
+            'Tamanho do pixel de saída (cm)',
+            type=QgsProcessingParameterNumber.Double,
+            defaultValue=3.0,
+            minValue=0.01,
+        ))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.GLI_THRESHOLD,
+            'Limiar GLI para classificar como vegetação',
             type=QgsProcessingParameterNumber.Double,
             defaultValue=0.0,
             minValue=-1.0,
             maxValue=1.0,
         ))
-
-        self.addParameter(QgsProcessingParameterNumber(
-            self.PARAM_BUFFER,
-            'Buffer do Contorno (unidades do CRS)',
-            type=QgsProcessingParameterNumber.Double,
-            defaultValue=0.1,
-            minValue=0.0,
+        self.addParameter(QgsProcessingParameterRasterDestination(
+            self.OUTPUT,
+            'Classificação de vegetação (GeoTIFF)',
         ))
-
-        self.addParameter(QgsProcessingParameterNumber(
-            self.PARAM_MIN_LENGTH,
-            'Comprimento Mínimo de Falha (metros)',
-            type=QgsProcessingParameterNumber.Double,
-            defaultValue=0.5,
-            minValue=0.0,
-        ))
-
-        self.addParameter(QgsProcessingParameterNumber(
-            self.PARAM_NIR_BAND,
-            'Banda NIR (somente se usar NDVI)',
-            type=QgsProcessingParameterNumber.Integer,
-            defaultValue=4,
-            minValue=1,
-            optional=True,
-        ))
-
-        self.addParameter(QgsProcessingParameterNumber(
-            self.PARAM_SIEVE_SIZE,
-            'Sieve — Mín. pixels por grupo (anti-ruído raster)',
-            type=QgsProcessingParameterNumber.Integer,
-            defaultValue=50,
-            minValue=0,
-        ))
-
-        self.addParameter(QgsProcessingParameterNumber(
-            self.PARAM_ANALYSIS_RES,
-            'Resolução de Análise (metros, 0=original)',
-            type=QgsProcessingParameterNumber.Double,
-            defaultValue=0.20,
-            minValue=0.0,
-        ))
-
-        self.addParameter(QgsProcessingParameterNumber(
-            self.PARAM_SIMPLIFY_TOL,
-            'Tolerância de Simplificação (unidades do CRS)',
-            type=QgsProcessingParameterNumber.Double,
-            defaultValue=0.1,
-            minValue=0.0,
-        ))
-
         self.addParameter(QgsProcessingParameterFeatureSink(
-            self.OUTPUT_FAILURES,
-            'Resultado das Falhas (Linhas)',
-            type=QgsProcessing.TypeVectorAnyGeometry,
-            createByDefault=True,
-            supportsAppend=True,
-            defaultValue=None,
+            self.OUTPUT_POINTS,
+            'Nuvem de pontos da cultura (GeoPackage)',
+            type=QgsProcessing.TypeVectorPoint,
         ))
 
-        self.addOutput(QgsProcessingOutputString(
-            self.OUTPUT_STATS,
-            'Estatísticas das Falhas',
-        ))
+    def processAlgorithm(self, parameters, context, feedback):
+        raster = self.parameterAsRasterLayer(parameters, self.INPUT_RASTER, context)
+        if raster is None or not raster.isValid():
+            raise QgsProcessingException('Selecione um raster de entrada válido.')
 
-    def processAlgorithm(self, parameters, context, model_feedback):
+        crs = raster.crs()
+        if not crs.isValid() or crs.isGeographic():
+            raise QgsProcessingException(
+                'O raster usa um CRS geográfico (graus). Reprojete-o para um CRS '
+                'projetado antes de definir o tamanho do pixel em centímetros.'
+            )
 
-        feedback = QgsProcessingMultiStepFeedback(self.TOTAL_STEPS, model_feedback)
-        results = {}
-        outputs = {}
-        step = 0
+        pixel_cm = self.parameterAsDouble(parameters, self.PIXEL_SIZE_CM, context)
+        threshold = self.parameterAsDouble(parameters, self.GLI_THRESHOLD, context)
+        red_band = self.parameterAsInt(parameters, self.RED_BAND, context)
+        green_band = self.parameterAsInt(parameters, self.GREEN_BAND, context)
+        blue_band = self.parameterAsInt(parameters, self.BLUE_BAND, context)
+        output_path = self.parameterAsOutputLayer(parameters, self.OUTPUT, context)
 
-        indice = self.parameterAsEnum(parameters, self.PARAM_INDEX, context)
-        threshold = self.parameterAsDouble(parameters, self.PARAM_THRESHOLD, context)
-        buffer_dist = self.parameterAsDouble(parameters, self.PARAM_BUFFER, context)
-        comp_minimo = self.parameterAsDouble(parameters, self.PARAM_MIN_LENGTH, context)
-        banda_nir = self.parameterAsInt(parameters, self.PARAM_NIR_BAND, context)
-        sieve_size = self.parameterAsInt(parameters, self.PARAM_SIEVE_SIZE, context)
-        resolucao = self.parameterAsDouble(parameters, self.PARAM_ANALYSIS_RES, context)
-        simplify_tol = self.parameterAsDouble(parameters, self.PARAM_SIMPLIFY_TOL, context)
+        # Convert the requested ground size to the units used by the projected CRS.
+        metres_per_map_unit = QgsUnitTypes.fromUnitToUnitFactor(
+            crs.mapUnits(), QgsUnitTypes.DistanceMeters)
+        if not metres_per_map_unit or not np.isfinite(metres_per_map_unit):
+            raise QgsProcessingException(
+                'Não foi possível converter as unidades do CRS para metros.'
+            )
+        pixel_size_map_units = (pixel_cm / 100.0) / metres_per_map_unit
 
-        context.setTransformContext(QgsProject.instance().transformContext())
-        project_crs = QgsProject.instance().crs().authid()
+        src = gdal.Open(raster.source(), gdal.GA_ReadOnly)
+        if src is None:
+            raise QgsProcessingException('O GDAL não conseguiu abrir o raster selecionado.')
+        band_count = src.RasterCount
+        if any(band < 1 or band > band_count
+               for band in (red_band, green_band, blue_band)):
+            src = None
+            raise QgsProcessingException(
+                f'O raster possui {band_count} banda(s). Ajuste os números das bandas RGB.'
+            )
+        if len(set((red_band, green_band, blue_band))) != 3:
+            src = None
+            raise QgsProcessingException('As bandas R, G e B devem ser diferentes.')
 
-        raster_layer = self.parameterAsRasterLayer(parameters, self.INPUT_RASTER, context)
-        raster_path = raster_layer.source()
+        width, height = src.RasterXSize, src.RasterYSize
+        transform = src.GetGeoTransform()
+        source_crs = src.GetProjection()
+        if not source_crs:
+            src = None
+            raise QgsProcessingException(
+                'O raster não tem sistema de referência espacial definido.'
+            )
 
-        logger.info(
-            'Análise de falha: índice=%s, threshold=%.3f, sieve=%d, '
-            'resolução=%.3f, simplificação=%.3f',
-            self.INDEX_CHOICES[indice], threshold, sieve_size,
-            resolucao, simplify_tol)
+        corners = [
+            (transform[0] + col * transform[1] + row * transform[2],
+             transform[3] + col * transform[4] + row * transform[5])
+            for col, row in ((0, 0), (width, 0), (0, height), (width, height))
+        ]
+        bounds = (
+            min(point[0] for point in corners),
+            min(point[1] for point in corners),
+            max(point[0] for point in corners),
+            max(point[1] for point in corners),
+        )
+        out_width = max(1, int(np.ceil((bounds[2] - bounds[0]) / pixel_size_map_units)))
+        out_height = max(1, int(np.ceil((bounds[3] - bounds[1]) / pixel_size_map_units)))
+        src = None
 
-        tmp_dir = tempfile.mkdtemp(prefix='falha_plantio_')
-
-        step += 1
-        feedback.pushInfo(f'Passo {step}/{self.TOTAL_STEPS}: Criando buffer no contorno...')
-        try:
-            alg_params = {
-                'DISSOLVE': False,
-                'DISTANCE': buffer_dist,
-                'END_CAP_STYLE': 0,
-                'INPUT': parameters[self.INPUT_POLYGON],
-                'JOIN_STYLE': 0,
-                'MITER_LIMIT': 2,
-                'SEGMENTS': 5,
-                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-            }
-            outputs['BufferContorno'] = processing.run(
-                'native:buffer', alg_params,
-                context=context, feedback=feedback, is_child_algorithm=True)
-        except Exception as e:
-            feedback.reportError(f'Erro no buffer do contorno: {e}', fatalError=True)
-            return {}
-        feedback.setCurrentStep(step)
-        if feedback.isCanceled():
-            return {}
-
-        step += 1
-        feedback.pushInfo(f'Passo {step}/{self.TOTAL_STEPS}: Recortando raster pelo contorno...')
-        try:
-            clipped_path = os.path.join(tmp_dir, 'clipped.tif')
-            self._clip_raster_by_mask(
-                raster_path,
-                outputs['BufferContorno']['OUTPUT'],
-                clipped_path,
-                context, feedback)
-            outputs['RasterRecortado'] = {'OUTPUT': clipped_path}
-        except Exception as e:
-            feedback.reportError(f'Erro ao recortar raster: {e}', fatalError=True)
-            return {}
-        feedback.setCurrentStep(step)
-        if feedback.isCanceled():
-            return {}
-
-        step += 1
-        feedback.pushInfo(f'Passo {step}/{self.TOTAL_STEPS}: Calculando índice de vegetação...')
-        try:
-            indice_path = os.path.join(tmp_dir, 'indice.tif')
-            self._calc_vegetation_index(
-                clipped_path, indice_path, indice, banda_nir, context, feedback)
-            outputs['CalculoIndice'] = {'OUTPUT': indice_path}
-        except Exception as e:
-            feedback.reportError(f'Erro no índice de vegetação: {e}', fatalError=True)
-            return {}
-        feedback.setCurrentStep(step)
-        if feedback.isCanceled():
-            return {}
-
-        step += 1
         feedback.pushInfo(
-            f'Passo {step}/{self.TOTAL_STEPS}: Máscara binária '
-            f'(threshold={threshold})...')
-        try:
-            mask_path = os.path.join(tmp_dir, 'mask.tif')
-            self._calc_binary_mask(indice_path, mask_path, threshold, context, feedback)
-            outputs['MascaraBinaria'] = {'OUTPUT': mask_path}
-        except Exception as e:
-            feedback.reportError(f'Erro na máscara de vegetação: {e}', fatalError=True)
-            return {}
-        feedback.setCurrentStep(step)
-        if feedback.isCanceled():
-            return {}
-
-        step += 1
-        if sieve_size > 0:
-            feedback.pushInfo(
-                f'Passo {step}/{self.TOTAL_STEPS}: Sieve filter '
-                f'(removendo grupos < {sieve_size} pixels)...')
-            try:
-                sieved_path = os.path.join(tmp_dir, 'sieved.tif')
-                self._apply_sieve(mask_path, sieved_path, sieve_size, context, feedback)
-                outputs['SieveFiltrado'] = {'OUTPUT': sieved_path}
-            except Exception as e:
-                feedback.reportError(f'Erro no sieve filter: {e}', fatalError=True)
-                return {}
-        else:
-            feedback.pushInfo(
-                f'Passo {step}/{self.TOTAL_STEPS}: Sieve filter desabilitado (tamanho=0).')
-            outputs['SieveFiltrado'] = {'OUTPUT': mask_path}
-        feedback.setCurrentStep(step)
-        if feedback.isCanceled():
-            return {}
-
-        step += 1
-        current_raster = outputs['SieveFiltrado']['OUTPUT']
-        if resolucao > 0:
-            feedback.pushInfo(
-                f'Passo {step}/{self.TOTAL_STEPS}: Reamostrando para '
-                f'{resolucao}m de resolução...')
-            try:
-                resampled_path = os.path.join(tmp_dir, 'resampled.tif')
-                self._resample_raster(current_raster, resampled_path, resolucao, context, feedback)
-                outputs['Reamostrado'] = {'OUTPUT': resampled_path}
-            except Exception as e:
-                feedback.reportError(f'Erro na reamostragem: {e}', fatalError=True)
-                return {}
-        else:
-            feedback.pushInfo(
-                f'Passo {step}/{self.TOTAL_STEPS}: Reamostragem desabilitada (resolução=0).')
-            outputs['Reamostrado'] = {'OUTPUT': current_raster}
-        feedback.setCurrentStep(step)
-        if feedback.isCanceled():
-            return {}
-
-        step += 1
+            f'Resolução solicitada: {pixel_cm:g} cm; '
+            f'índice de saída aproximado: {out_width} × {out_height} pixels.'
+        )
         feedback.pushInfo(
-            f'Passo {step}/{self.TOTAL_STEPS}: Convertendo raster em polígonos...')
-        try:
-            poly_path = os.path.join(tmp_dir, 'polygons.gpkg')
-            self._polygonize_raster(outputs['Reamostrado']['OUTPUT'], poly_path, context, feedback)
-            outputs['Vetorizar'] = {'OUTPUT': poly_path}
-        except Exception as e:
-            feedback.reportError(f'Erro na poligonização: {e}', fatalError=True)
-            return {}
-        feedback.setCurrentStep(step)
-        if feedback.isCanceled():
-            return {}
-
-        step += 1
-        feedback.pushInfo(
-            f'Passo {step}/{self.TOTAL_STEPS}: Extraindo polígonos de vegetação (DN=1)...')
-        try:
-            alg_params = {
-                'FIELD': 'DN',
-                'INPUT': poly_path,
-                'OPERATOR': 0,
-                'VALUE': '1',
-                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-            }
-            outputs['ExtrairPlanta'] = processing.run(
-                'native:extractbyattribute', alg_params,
-                context=context, feedback=feedback, is_child_algorithm=True)
-        except Exception as e:
-            feedback.reportError(f'Erro ao extrair vegetação: {e}', fatalError=True)
-            return {}
-        feedback.setCurrentStep(step)
-        if feedback.isCanceled():
-            return {}
-
-        step += 1
-        feedback.pushInfo(
-            f'Passo {step}/{self.TOTAL_STEPS}: Dissolvendo polígonos adjacentes...')
-        try:
-            alg_params = {
-                'INPUT': outputs['ExtrairPlanta']['OUTPUT'],
-                'FIELD': [],
-                'SEPARATE_DISJOINT': False,
-                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-            }
-            outputs['VegetacaoFundida'] = processing.run(
-                'native:dissolve', alg_params,
-                context=context, feedback=feedback, is_child_algorithm=True)
-        except Exception as e:
-            feedback.reportError(f'Erro ao dissolver polígonos: {e}', fatalError=True)
-            return {}
-        feedback.setCurrentStep(step)
-        if feedback.isCanceled():
-            return {}
-
-        step += 1
-        if simplify_tol > 0:
-            feedback.pushInfo(
-                f'Passo {step}/{self.TOTAL_STEPS}: Simplificando geometrias '
-                f'(tolerância={simplify_tol})...')
-            try:
-                alg_params = {
-                    'INPUT': outputs['VegetacaoFundida']['OUTPUT'],
-                    'METHOD': 0,
-                    'TOLERANCE': simplify_tol,
-                    'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-                }
-                outputs['VegetacaoSimplificada'] = processing.run(
-                    'native:simplifygeometries', alg_params,
-                    context=context, feedback=feedback, is_child_algorithm=True)
-            except Exception as e:
-                feedback.reportError(f'Erro ao simplificar: {e}', fatalError=True)
-                return {}
-        else:
-            feedback.pushInfo(
-                f'Passo {step}/{self.TOTAL_STEPS}: Simplificação desabilitada (tolerância=0).')
-            outputs['VegetacaoSimplificada'] = {
-                'OUTPUT': outputs['VegetacaoFundida']['OUTPUT']}
-        feedback.setCurrentStep(step)
-        if feedback.isCanceled():
-            return {}
-
-        step += 1
-        feedback.pushInfo(
-            f'Passo {step}/{self.TOTAL_STEPS}: Recortando linhas de plantio...')
-        try:
-            alg_params = {
-                'INPUT': parameters[self.INPUT_LINES],
-                'OVERLAY': outputs['BufferContorno']['OUTPUT'],
-                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-            }
-            outputs['LinhasNoTalhao'] = processing.run(
-                'native:clip', alg_params,
-                context=context, feedback=feedback, is_child_algorithm=True)
-        except Exception as e:
-            feedback.reportError(f'Erro ao recortar linhas: {e}', fatalError=True)
-            return {}
-        feedback.setCurrentStep(step)
-        if feedback.isCanceled():
-            return {}
-
-        step += 1
-        feedback.pushInfo(
-            f'Passo {step}/{self.TOTAL_STEPS}: Calculando diferença '
-            f'(linhas − vegetação = falhas)...')
-        try:
-            alg_params = {
-                'INPUT': outputs['LinhasNoTalhao']['OUTPUT'],
-                'OVERLAY': outputs['VegetacaoSimplificada']['OUTPUT'],
-                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-            }
-            outputs['GerarFalhas'] = processing.run(
-                'native:difference', alg_params,
-                context=context, feedback=feedback, is_child_algorithm=True)
-        except Exception as e:
-            feedback.reportError(f'Erro ao gerar falhas: {e}', fatalError=True)
-            return {}
-        feedback.setCurrentStep(step)
-        if feedback.isCanceled():
-            return {}
-
-        step += 1
-        feedback.pushInfo(
-            f'Passo {step}/{self.TOTAL_STEPS}: Explodindo geometrias multipartes...')
-        try:
-            alg_params = {
-                'INPUT': outputs['GerarFalhas']['OUTPUT'],
-                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-            }
-            outputs['PartesSimples'] = processing.run(
-                'native:multiparttosingleparts', alg_params,
-                context=context, feedback=feedback, is_child_algorithm=True)
-        except Exception as e:
-            feedback.reportError(f'Erro ao explodir multipartes: {e}', fatalError=True)
-            return {}
-        feedback.setCurrentStep(step)
-        if feedback.isCanceled():
-            return {}
-
-        step += 1
-        feedback.pushInfo(
-            f'Passo {step}/{self.TOTAL_STEPS}: Calculando comprimento das falhas...')
-        try:
-            alg_params = {
-                'FIELD_LENGTH': 10,
-                'FIELD_NAME': 'comp_m',
-                'FIELD_PRECISION': 2,
-                'FIELD_TYPE': 0,
-                'FORMULA': '$length',
-                'INPUT': outputs['PartesSimples']['OUTPUT'],
-                'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-            }
-            outputs['ComComprimento'] = processing.run(
-                'native:fieldcalculator', alg_params,
-                context=context, feedback=feedback, is_child_algorithm=True)
-        except Exception as e:
-            feedback.reportError(f'Erro ao calcular comprimento: {e}', fatalError=True)
-            return {}
-        feedback.setCurrentStep(step)
-        if feedback.isCanceled():
-            return {}
-
-        step += 1
-        feedback.pushInfo(
-            f'Passo {step}/{self.TOTAL_STEPS}: Filtrando falhas < {comp_minimo}m...')
-        try:
-            alg_params = {
-                'FIELD': 'comp_m',
-                'INPUT': outputs['ComComprimento']['OUTPUT'],
-                'OPERATOR': 2,
-                'VALUE': str(comp_minimo),
-                'OUTPUT': parameters[self.OUTPUT_FAILURES],
-            }
-            outputs['ResultadoFinal'] = processing.run(
-                'native:extractbyattribute', alg_params,
-                context=context, feedback=feedback, is_child_algorithm=True)
-        except Exception as e:
-            feedback.reportError(f'Erro ao filtrar por comprimento: {e}', fatalError=True)
-            return {}
-        feedback.setCurrentStep(step)
-        if feedback.isCanceled():
-            return {}
-
-        results[self.OUTPUT_FAILURES] = outputs['ResultadoFinal']['OUTPUT']
-
-        step += 1
-        feedback.pushInfo(f'Passo {step}/{self.TOTAL_STEPS}: Gerando estatísticas...')
-        try:
-            stats = self._calcular_estatisticas(
-                outputs['ResultadoFinal']['OUTPUT'],
-                outputs['LinhasNoTalhao']['OUTPUT'],
-                context, feedback)
-            results[self.OUTPUT_STATS] = stats
-            feedback.pushInfo(stats)
-        except Exception as e:
-            feedback.reportError(f'Aviso: Estatísticas indisponíveis: {e}')
-            results[self.OUTPUT_STATS] = 'Estatísticas indisponíveis'
-        feedback.setCurrentStep(step)
-
-        logger.info('Análise de falha de plantio concluída com sucesso.')
-        return results
-
-    def _clip_raster_by_mask(self, raster_path, mask_layer_ref, output_path, context, feedback):
-        alg_params = {
-            'INPUT': raster_path,
-            'MASK': mask_layer_ref,
-            'CROP_TO_CUTLINE': True,
-            'KEEP_RESOLUTION': True,
-            'NODATA': None,
-            'OUTPUT': output_path,
-        }
-        try:
-            processing.run('gdal:cliprasterbymasklayer', alg_params,
-                           context=context, feedback=feedback, is_child_algorithm=True)
-        except Exception as e:
-            raise RuntimeError(f'gdal:cliprasterbymasklayer falhou: {e}')
-            
-        if not os.path.exists(output_path):
-            raise RuntimeError('gdal:cliprasterbymasklayer não gerou o output esperado')
-            
-        feedback.pushInfo(f'Raster recortado salvo em: {output_path}')
-
-    def _calc_vegetation_index(self, raster_path, output_path, indice, banda_nir, context, feedback):
-        if indice == 0:
-            feedback.pushInfo('Calculando GLI (RGB)...')
-            # GLI = (2*G - R - B) / (2*G + R + B)
-            # Bandas usuais RGB: 1=Red, 2=Green, 3=Blue
-            alg_params = {
-                'INPUT_A': raster_path,
-                'BAND_A': 1,
-                'INPUT_B': raster_path,
-                'BAND_B': 2,
-                'INPUT_C': raster_path,
-                'BAND_C': 3,
-                'FORMULA': '(2.0 * B - 1.0 * A - 1.0 * C) / (2.0 * B + 1.0 * A + 1.0 * C + 0.0001)',
-                'RTYPE': 5, # Float32
-                'OUTPUT': output_path,
-            }
-        else:
-            feedback.pushInfo(f'Calculando NDVI (NIR=banda {banda_nir})...')
-            # NDVI = (NIR - R) / (NIR + R)
-            alg_params = {
-                'INPUT_A': raster_path,
-                'BAND_A': 1,
-                'INPUT_B': raster_path,
-                'BAND_B': banda_nir,
-                'FORMULA': '(1.0 * B - 1.0 * A) / (1.0 * B + 1.0 * A + 0.0001)',
-                'RTYPE': 5, # Float32
-                'OUTPUT': output_path,
-            }
-
-        try:
-            processing.run('gdal:rastercalculator', alg_params,
-                           context=context, feedback=feedback, is_child_algorithm=True)
-        except Exception as e:
-            raise RuntimeError(f'gdal:rastercalculator (vegetation index) falhou: {e}')
-
-        if not os.path.exists(output_path):
-            raise RuntimeError('Falha ao gerar o índice de vegetação via gdal:rastercalculator')
-
-    def _calc_binary_mask(self, raster_path, output_path, threshold, context, feedback):
-        # Limiarização: Retorna 1 se > threshold, senão 0
-        alg_params = {
-            'INPUT_A': raster_path,
-            'BAND_A': 1,
-            'FORMULA': f'1 * (A > {threshold})',
-            'RTYPE': 0, # Byte
-            'OUTPUT': output_path,
-        }
-        try:
-            processing.run('gdal:rastercalculator', alg_params,
-                           context=context, feedback=feedback, is_child_algorithm=True)
-        except Exception as e:
-            raise RuntimeError(f'gdal:rastercalculator (binary mask) falhou: {e}')
-
-        if not os.path.exists(output_path):
-            raise RuntimeError('Falha ao gerar a máscara binária via gdal:rastercalculator')
-
-    def _apply_sieve(self, raster_path, output_path, threshold, context, feedback):
-        alg_params = {
-            'INPUT': raster_path,
-            'THRESHOLD': threshold,
-            'EIGHT_CONNECTEDNESS': False,
-            'NO_MASK': False,
-            'MASK_LAYER': None,
-            'EXTRA': '',
-            'OUTPUT': output_path,
-        }
-        try:
-            processing.run('gdal:sieve', alg_params,
-                           context=context, feedback=feedback, is_child_algorithm=True)
-        except Exception as e:
-            raise RuntimeError(f'gdal:sieve falhou: {e}')
-
-        if not os.path.exists(output_path):
-            raise RuntimeError('Falha ao aplicar o filtro sieve')
-            
-        feedback.pushInfo(f'Sieve filter aplicado (threshold={threshold})')
-
-    def _resample_raster(self, raster_path, output_path, target_res, context, feedback):
-        alg_params = {
-            'INPUT': raster_path,
-            'SOURCE_CRS': None,
-            'TARGET_CRS': None,
-            'RESAMPLING': 0, # Nearest Neighbour
-            'NODATA': None,
-            'TARGET_RESOLUTION': target_res,
-            'OPTIONS': '',
-            'DATA_TYPE': 0, # Use Input Layer Data Type
-            'TARGET_EXTENT': None,
-            'TARGET_EXTENT_CRS': None,
-            'MULTITHREADING': False,
-            'EXTRA': '',
-            'OUTPUT': output_path,
-        }
-        try:
-            processing.run('gdal:warpresolution', alg_params,
-                           context=context, feedback=feedback, is_child_algorithm=True)
-        except Exception as e:
-            raise RuntimeError(f'gdal:warpresolution falhou na reamostragem: {e}')
-
-        if not os.path.exists(output_path):
-            raise RuntimeError('Falha ao reamostrar o raster')
-            
-        feedback.pushInfo(f'Reamostrado para {target_res}m')
-
-    def _polygonize_raster(self, raster_path, output_path, context, feedback):
-        alg_params = {
-            'INPUT': raster_path,
-            'BAND': 1,
-            'FIELD': 'DN',
-            'EIGHT_CONNECTEDNESS': False,
-            'EXTRA': '',
-            'OUTPUT': output_path,
-        }
-        try:
-            processing.run('gdal:polygonize', alg_params,
-                           context=context, feedback=feedback, is_child_algorithm=True)
-        except Exception as e:
-            raise RuntimeError(f'gdal:polygonize falhou: {e}')
-
-        if not os.path.exists(output_path):
-            raise RuntimeError('Falha ao poligonizar o raster')
-            
-        feedback.pushInfo(f'Poligonização concluída: {output_path}')
-
-    def _calcular_estatisticas(self, falhas_output, linhas_output, context, feedback):
-
-        alg_params = {
-            'FIELD_LENGTH': 10,
-            'FIELD_NAME': 'comp_linha_m',
-            'FIELD_PRECISION': 2,
-            'FIELD_TYPE': 0,
-            'FORMULA': '$length',
-            'INPUT': linhas_output,
-            'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-        }
-        linhas_com_comp = processing.run(
-            'native:fieldcalculator', alg_params,
-            context=context, feedback=feedback, is_child_algorithm=True)
-
-        stats_linhas = processing.run(
-            'qgis:basicstatisticsforfields', {
-                'FIELD_NAME': 'comp_linha_m',
-                'INPUT': linhas_com_comp['OUTPUT'],
-                'OUTPUT_HTML_FILE': QgsProcessing.TEMPORARY_OUTPUT,
-            },
-            context=context, feedback=feedback, is_child_algorithm=True)
-        comp_total_linhas = float(stats_linhas.get('SUM', 0))
-
-        stats_falhas = processing.run(
-            'qgis:basicstatisticsforfields', {
-                'FIELD_NAME': 'comp_m',
-                'INPUT': falhas_output,
-                'OUTPUT_HTML_FILE': QgsProcessing.TEMPORARY_OUTPUT,
-            },
-            context=context, feedback=feedback, is_child_algorithm=True)
-
-        total_falhas = int(stats_falhas.get('COUNT', 0))
-        comp_total = float(stats_falhas.get('SUM', 0))
-        comp_medio = float(stats_falhas.get('MEAN', 0))
-        comp_max = float(stats_falhas.get('MAX', 0))
-
-        percentual = (comp_total / comp_total_linhas * 100) if comp_total_linhas > 0 else 0.0
-
-        return (
-            '========== ESTATÍSTICAS DE FALHAS ==========\n'
-            f'Total de falhas encontradas: {total_falhas}\n'
-            f'Comprimento total de falhas: {comp_total:.2f} m\n'
-            f'Comprimento médio por falha: {comp_medio:.2f} m\n'
-            f'Maior falha encontrada:      {comp_max:.2f} m\n'
-            f'Comprimento total de linhas: {comp_total_linhas:.2f} m\n'
-            f'Percentual de falha:         {percentual:.2f}%\n'
-            '============================================='
+            'O tamanho configurado define o espaçamento dos pixels no GeoTIFF; '
+            'não cria detalhe além da resolução espacial original da imagem.'
         )
 
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='falha_plantio_rgb_') as temp_dir:
+            vrt_path = os.path.join(temp_dir, 'rgb.vrt')
+            rgb_path = os.path.join(temp_dir, 'rgb_resampled.tif')
+            vrt = gdal.BuildVRT(
+                vrt_path,
+                raster.source(),
+                options=gdal.BuildVRTOptions(
+                    bandList=[red_band, green_band, blue_band]
+                ),
+            )
+            if vrt is None:
+                raise QgsProcessingException('Não foi possível preparar as bandas RGB.')
+            vrt = None
+
+            def warp_progress(_complete, _message, _data):
+                return 0 if feedback.isCanceled() else 1
+
+            warped = gdal.Warp(
+                rgb_path,
+                vrt_path,
+                options=gdal.WarpOptions(
+                    format='GTiff',
+                    outputBounds=bounds,
+                    xRes=pixel_size_map_units,
+                    yRes=pixel_size_map_units,
+                    resampleAlg='bilinear',
+                    outputType=gdal.GDT_Float32,
+                    creationOptions=['TILED=YES', 'COMPRESS=DEFLATE', 'BIGTIFF=IF_SAFER'],
+                    callback=warp_progress,
+                ),
+            )
+            if warped is None:
+                if feedback.isCanceled():
+                    return {}
+                raise QgsProcessingException('Falha ao reamostrar as bandas RGB.')
+            warped = None
+            if feedback.isCanceled():
+                return {}
+
+            rgb = gdal.Open(rgb_path, gdal.GA_ReadOnly)
+            out_width = rgb.RasterXSize
+            out_height = rgb.RasterYSize
+            driver = gdal.GetDriverByName('GTiff')
+            result = driver.Create(
+                output_path, out_width, out_height, 1, gdal.GDT_Byte,
+                options=['TILED=YES', 'COMPRESS=DEFLATE', 'BIGTIFF=IF_SAFER'],
+            )
+            if result is None:
+                rgb = None
+                raise QgsProcessingException(f'Não foi possível criar: {output_path}')
+            result.SetGeoTransform(rgb.GetGeoTransform())
+            result.SetProjection(rgb.GetProjection())
+            result.SetMetadataItem('CLASS_0', 'Sem vegetação verde detectada')
+            result.SetMetadataItem('CLASS_1', 'Vegetação verde detectada')
+            result.SetMetadataItem('INDEX', 'GLI=(2*G-R-B)/(2*G+R+B)')
+            result.SetMetadataItem('GLI_THRESHOLD', str(threshold))
+            result.SetMetadataItem('PIXEL_SIZE_CM', str(pixel_cm))
+
+            result_band = result.GetRasterBand(1)
+            result_band.SetNoDataValue(255)
+            color_table = gdal.ColorTable()
+            color_table.SetColorEntry(0, (220, 50, 50, 255))
+            color_table.SetColorEntry(1, (20, 180, 40, 255))
+            color_table.SetColorEntry(255, (0, 0, 0, 0))
+            result_band.SetRasterColorTable(color_table)
+            result_band.SetRasterColorInterpretation(gdal.GCI_PaletteIndex)
+
+            point_fields = QgsFields()
+            point_fields.append(QgsField('gli', QVariant.Double, len=12, prec=7))
+            point_fields.append(QgsField('classe', QVariant.Int))
+            point_sink, point_destination = self.parameterAsSink(
+                parameters,
+                self.OUTPUT_POINTS,
+                context,
+                point_fields,
+                QgsWkbTypes.Point,
+                crs,
+            )
+            if point_sink is None:
+                result = None
+                rgb = None
+                raise QgsProcessingException('Não foi possível criar a nuvem de pontos.')
+
+            block_rows = 256
+            nodata_values = [rgb.GetRasterBand(i).GetNoDataValue() for i in (1, 2, 3)]
+            geotransform = rgb.GetGeoTransform()
+            point_batch = []
+            point_count = 0
+            for row in range(0, out_height, block_rows):
+                if feedback.isCanceled():
+                    result = None
+                    rgb = None
+                    try:
+                        os.remove(output_path)
+                    except OSError:
+                        pass
+                    return {}
+                rows = min(block_rows, out_height - row)
+                red = rgb.GetRasterBand(1).ReadAsArray(0, row, out_width, rows)
+                green = rgb.GetRasterBand(2).ReadAsArray(0, row, out_width, rows)
+                blue = rgb.GetRasterBand(3).ReadAsArray(0, row, out_width, rows)
+                denominator = 2.0 * green + red + blue
+                gli = np.zeros(denominator.shape, dtype=np.float32)
+                np.divide(2.0 * green - red - blue, denominator,
+                          out=gli, where=denominator != 0)
+                vegetation = (gli > threshold).astype(np.uint8)
+                valid = np.isfinite(red) & np.isfinite(green) & np.isfinite(blue)
+                for data, nodata in zip((red, green, blue), nodata_values):
+                    if nodata is not None:
+                        valid &= data != nodata
+                vegetation[~valid] = 255
+                result_band.WriteArray(vegetation, 0, row)
+
+                for local_row in range(rows):
+                    green_columns = np.flatnonzero(vegetation[local_row] == 1)
+                    y = (geotransform[3] + (row + local_row + 0.5) * geotransform[5]
+                         + 0.5 * geotransform[4])
+                    for column in green_columns:
+                        x = (geotransform[0] + (column + 0.5) * geotransform[1]
+                             + (row + local_row + 0.5) * geotransform[2])
+                        feature = QgsFeature(point_fields)
+                        feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(x, y)))
+                        feature.setAttributes([float(gli[local_row, column]), 1])
+                        point_batch.append(feature)
+                        point_count += 1
+                        if len(point_batch) >= 5000:
+                            if not point_sink.addFeatures(
+                                    point_batch, QgsFeatureSink.FastInsert):
+                                raise QgsProcessingException(
+                                    'Erro ao gravar pontos da cultura no GeoPackage.'
+                                )
+                            point_batch = []
+                feedback.setProgress(100.0 * min(row + rows, out_height) / out_height)
+
+            if point_batch and not point_sink.addFeatures(
+                    point_batch, QgsFeatureSink.FastInsert):
+                raise QgsProcessingException(
+                    'Erro ao gravar os últimos pontos da cultura no GeoPackage.'
+                )
+            point_sink = None
+
+            result_band.FlushCache()
+            result.FlushCache()
+            result = None
+            rgb = None
+
+        feedback.pushInfo(
+            'Classificação concluída: 1 = vegetação verde; 0 = sem vegetação verde; '
+            '255 = NoData.'
+        )
+        feedback.pushInfo(f'Pontos de vegetação gravados: {point_count}.')
+        return {self.OUTPUT: output_path, self.OUTPUT_POINTS: point_destination}
+
     def name(self):
-        return 'falha_plantio_estavel'
+        return 'classificar_vegetacao_rgb'
 
     def displayName(self):
-        return 'Falha de Plantio (Cana-de-açúcar)'
+        return 'Classificar vegetação verde (RGB)'
 
     def group(self):
-        return 'Análise'
+        return 'Análise de falhas'
 
     def groupId(self):
-        return 'analise'
+        return 'analise_falhas'
 
     def createInstance(self):
         return FalhaDePlantioAlgorithm()
 
     def shortHelpString(self):
         return (
-            'Identifica falhas de plantio na cultura de cana-de-açúcar '
-            'usando imagem aérea, linhas de plantio e contorno do talhão.\n\n'
-            'OTIMIZADO para imagens de drone de alta resolução '
-            '(>15.000×15.000 pixels).\n\n'
-            'ENTRADAS:\n'
-            '• Raster — imagem RGB de drone/satélite (ou multibanda com NIR)\n'
-            '• Linhas de Plantio — camada vetorial de linhas\n'
-            '• Contorno do Talhão — polígono delimitador da área\n\n'
-            'PARÂMETROS DE ANÁLISE:\n'
-            '• Índice de Vegetação — GLI (RGB) ou NDVI (NIR+Vermelho)\n'
-            '• Limiar de Vegetação — valor mínimo do índice (padrão: 0.0)\n'
-            '• Buffer do Contorno — expansão para evitar ruído nas bordas\n'
-            '• Comprimento Mínimo — falhas menores são ignoradas (filtro)\n'
-            '• Banda NIR — número da banda infravermelha (apenas NDVI)\n\n'
-            'PARÂMETROS DE PERFORMANCE:\n'
-            '• Sieve — remove grupos de pixels isolados menores que N '
-            'pixels. Valores maiores = menos ruído, mais rápido (padrão: 50)\n'
-            '• Resolução de Análise — reamostra o raster para esta resolução '
-            'em metros antes de poligonizar. Ex: 0.20 = 20cm. '
-            '0 = mantém resolução original (padrão: 0.20)\n'
-            '• Tolerância de Simplificação — Douglas-Peucker nos polígonos '
-            'de vegetação. Valores maiores = menos vértices (padrão: 0.1)\n\n'
-            'SAÍDAS:\n'
-            '• Linhas de falha com atributo comp_m (comprimento em metros)\n'
-            '• Estatísticas: total, comprimento médio, maior falha, '
-            'percentual\n\n'
-            'Desenvolvido por CainC0de — Código livre (GPL v2+)'
+            'Classifica cada pixel de uma imagem RGB como vegetação verde (1) ou '
+            'sem vegetação verde (0), usando o índice GLI: '
+            '(2G − R − B) / (2G + R + B). Pixels NoData recebem o valor 255.\n\n'
+            'Escolha as bandas R, G e B conforme a ordem do seu raster, informe o '
+            'limiar GLI e o tamanho de pixel de saída em centímetros. O algoritmo '
+            'grava a classificação em GeoTIFF e cria uma camada de pontos GeoPackage '
+            'com um ponto no centro de cada pixel verde classificado. O raster precisa '
+            'usar um CRS projetado.\n\n'
+            'A resolução de saída define o espaçamento dos pixels e não aumenta o '
+            'detalhe real da imagem. Esta etapa detecta cobertura verde em RGB; '
+            'ela não distingue cana de plantas daninhas sem linhas de plantio, '
+            'bandas adicionais ou treinamento/classificação específica. A saída de '
+            'pontos é 2D porque uma imagem RGB não contém elevação.'
         )
 
     def helpUrl(self):
