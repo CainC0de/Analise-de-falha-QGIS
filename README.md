@@ -47,9 +47,12 @@ o espaçamento das fileiras, agrupa os pontos por linha e cria uma camada
 vetorial com traçados ajustados localmente aos pontos. Cada linha é ajustada de
 forma independente para preservar pequenas curvas e variações observadas no
 campo. O espaçamento esperado (padrão: 1,5 m), a largura de associação dos
-pontos e o maior intervalo a interpolar podem ser ajustados. A imagem original
-pode estar em outro CRS; o algoritmo confere a sobreposição e grava as linhas
-no CRS métrico da nuvem de pontos.
+pontos, a densidade mínima por trecho e o maior intervalo a interpolar podem ser
+ajustados. Picos compatíveis com a grade do plantio são priorizados para reduzir
+linhas duplicadas; cada trecho usa a mediana transversal dos pontos para diminuir
+o deslocamento causado por pontos isolados. A imagem original pode estar em outro
+CRS; o algoritmo confere a sobreposição e grava as linhas no CRS métrico da nuvem
+de pontos.
 
 ## Instalação
 

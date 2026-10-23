@@ -31,6 +31,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
     ROW_SPACING = 'ROW_SPACING'
     MAX_DEVIATION = 'MAX_DEVIATION'
     MAX_GAP = 'MAX_GAP'
+    MIN_POINTS_PER_BIN = 'MIN_POINTS_PER_BIN'
     OUTPUT = 'OUTPUT'
     SAMPLE_LIMIT = 50000
     POINT_BATCH = 50000
@@ -56,7 +57,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             self.MAX_DEVIATION,
             'Largura máxima para associar pontos à linha (m)',
             type=QgsProcessingParameterNumber.Double,
-            defaultValue=0.45,
+            defaultValue=0.65,
             minValue=0.05,
             maxValue=1.5,
         ))
@@ -67,6 +68,14 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             defaultValue=3.0,
             minValue=0.5,
             maxValue=20.0,
+        ))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.MIN_POINTS_PER_BIN,
+            'Mínimo de pontos para sustentar cada trecho (filtro de ruído)',
+            type=QgsProcessingParameterNumber.Integer,
+            defaultValue=4,
+            minValue=1,
+            maxValue=1000,
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUTPUT,
@@ -109,6 +118,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         spacing = self.parameterAsDouble(parameters, self.ROW_SPACING, context)
         max_deviation = self.parameterAsDouble(parameters, self.MAX_DEVIATION, context)
         max_gap = self.parameterAsDouble(parameters, self.MAX_GAP, context)
+        min_points = self.parameterAsInt(parameters, self.MIN_POINTS_PER_BIN, context)
         point_count = points.featureCount()
         if point_count < 10:
             raise QgsProcessingException(
@@ -148,17 +158,21 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         along_min, along_max = self._projected_bounds(bounds, along)
         along_bin = 0.50
         along_count = max(1, int(math.ceil((along_max - along_min) / along_bin)) + 1)
-        if len(centers) * along_count > 100000000:
+        cross_bin_size = 0.05
+        cross_bin_count = int(math.ceil(2.0 * max_deviation / cross_bin_size)) + 1
+        histogram_size = len(centers) * along_count * cross_bin_count
+        if histogram_size > 40000000:
             raise QgsProcessingException(
-                'A grade de restituição ficou grande demais. Use uma área menor ou '
-                'aumente o tamanho do pixel na etapa de classificação.'
+                'A grade robusta de restituição ficou grande demais. Processe uma '
+                'área menor ou aumente o tamanho do pixel na classificação.'
             )
-        offsets_sum = np.zeros((len(centers), along_count), dtype=np.float64)
-        counts = np.zeros((len(centers), along_count), dtype=np.uint32)
+        cross_histogram = np.zeros(
+            (len(centers), along_count, cross_bin_count), dtype=np.uint32
+        )
         feedback.pushInfo('Ajustando cada linha aos pontos da cultura...')
         self._accumulate_rows(
             points, centers, along, across, along_min, along_bin,
-            max_deviation, offsets_sum, counts, feedback,
+            max_deviation, cross_bin_size, cross_histogram, feedback,
         )
         if feedback.isCanceled():
             return {}
@@ -178,7 +192,9 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         for row_id, _center in enumerate(centers, start=1):
             if feedback.isCanceled():
                 return {}
-            observed = np.flatnonzero(counts[row_id - 1] > 0)
+            histogram = cross_histogram[row_id - 1]
+            row_counts = histogram.sum(axis=1)
+            observed = np.flatnonzero(row_counts >= min_points)
             if observed.size < 2:
                 continue
             breaks = np.flatnonzero(np.diff(observed) * along_bin > max_gap)
@@ -188,9 +204,16 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                     continue
                 start, end = int(group[0]), int(group[-1])
                 bins = np.arange(start, end + 1)
-                observed_offsets = offsets_sum[row_id - 1, group] / counts[row_id - 1, group]
+                group_histogram = histogram[group]
+                cumulative = np.cumsum(group_histogram, axis=1)
+                halfway = (row_counts[group, None] + 1) // 2
+                median_bins = np.argmax(cumulative >= halfway, axis=1)
+                observed_offsets = (
+                    centers[row_id - 1] - max_deviation
+                    + median_bins * cross_bin_size
+                )
                 fitted = np.interp(bins, group, observed_offsets)
-                fitted = self._smooth(fitted, window=5)
+                fitted = self._smooth(fitted, window=3)
                 line_points = []
                 for index, offset in zip(bins, fitted):
                     t = along_min + index * along_bin
@@ -314,15 +337,44 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         if not local_maxima:
             return []
         peak_floor = max(float(smoothed.max()) * 0.08, float(np.median(smoothed)) * 1.15)
-        ordered = sorted(
-            (i for i in local_maxima if smoothed[i] >= peak_floor),
-            key=lambda i: smoothed[i], reverse=True,
-        )
-        selected = []
-        for index in ordered:
-            if all(abs(index - other) >= minimum_distance for other in selected):
-                selected.append(index)
-        return sorted(start + index * bin_size for index in selected)
+        candidates = [i for i in local_maxima if smoothed[i] >= peak_floor]
+        if not candidates:
+            return []
+
+        # Anchor a row-spacing lattice on each plausible peak. Choosing one
+        # strongest, regularly spaced sequence suppresses duplicate peaks from
+        # dense patches or weeds inside a single planted row.
+        tolerance = max(minimum_distance // 2, int(round(spacing * 0.28 / bin_size)))
+        spacing_bins = spacing / bin_size
+        best_sequence = []
+        best_strength = float('-inf')
+        for anchor in candidates:
+            sequence = [anchor]
+            for direction in (-1, 1):
+                current = anchor
+                while True:
+                    target = current + direction * spacing_bins
+                    options = [
+                        peak for peak in candidates
+                        if direction * (peak - current) >= minimum_distance
+                        and abs(peak - target) <= tolerance
+                    ]
+                    if not options:
+                        break
+                    chosen = min(
+                        options,
+                        key=lambda peak: abs(peak - target)
+                        - 0.02 * smoothed[peak] / (smoothed.max() + 1e-9),
+                    )
+                    if chosen in sequence:
+                        break
+                    sequence.append(chosen)
+                    current = chosen
+            strength = len(sequence) * 1e6 + sum(smoothed[i] for i in sequence)
+            if strength > best_strength:
+                best_sequence, best_strength = sequence, strength
+        selected = sorted(set(best_sequence))
+        return [start + index * bin_size for index in selected]
 
     def _coordinate_batches(self, layer):
         batch = []
@@ -340,7 +392,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
 
     def _accumulate_rows(
             self, layer, centers, along, across, along_min, along_bin,
-            max_deviation, offsets_sum, counts, feedback):
+            max_deviation, cross_bin_size, cross_histogram, feedback):
         centers_array = np.asarray(centers)
         for coordinates in self._coordinate_batches(layer):
             if feedback.isCanceled():
@@ -355,11 +407,19 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             offset = np.abs(s - centers_array[row])
             valid = offset <= max_deviation
             along_index = np.floor((t - along_min) / along_bin).astype(np.int64)
-            valid &= (along_index >= 0) & (along_index < counts.shape[1])
+            valid &= (along_index >= 0) & (along_index < cross_histogram.shape[1])
             if not np.any(valid):
                 continue
-            np.add.at(offsets_sum, (row[valid], along_index[valid]), s[valid])
-            np.add.at(counts, (row[valid], along_index[valid]), 1)
+            cross_index = np.floor(
+                (s[valid] - centers_array[row[valid]] + max_deviation)
+                / cross_bin_size
+            ).astype(np.int64)
+            cross_index = np.clip(cross_index, 0, cross_histogram.shape[2] - 1)
+            np.add.at(
+                cross_histogram,
+                (row[valid], along_index[valid], cross_index),
+                1,
+            )
 
     def _smooth(self, values, window):
         if len(values) < window:
@@ -391,7 +451,9 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             'linha ajustada localmente aos pontos. As linhas podem ter pequenas '
             'curvas independentes; o algoritmo não força todas a serem paralelas. '
             'A saída é uma camada vetorial de linhas no CRS da imagem.\n\n'
-            'Ajuste o espaçamento esperado conforme o plantio. Os pontos precisam '
-            'estar em CRS projetado em metros; a imagem pode estar em outro CRS '
-            'e será usada para conferir a área analisada.'
+            'Ajuste o espaçamento esperado conforme o plantio. A posição de cada '
+            'trecho usa a mediana transversal dos pontos para reduzir o efeito de '
+            'pontos fora do centro, e a densidade mínima descarta trechos sustentados '
+            'por poucos pontos. Os pontos precisam estar em CRS métrico; a imagem '
+            'pode estar em outro CRS e é usada para conferir a área analisada.'
         )
