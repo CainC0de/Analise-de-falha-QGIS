@@ -156,23 +156,21 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         )
         along_length = max(0.0, along_max - along_min)
         station_count = max(1, int(math.ceil(along_length / station_step)) + 1)
-        cell_limit = 20000000
-        if cross_bin_count > cell_limit:
+        if cross_bin_count > 2000000:
             raise QgsProcessingException(
-                'A largura da área é grande demais para a grade local. Confira '
-                'a extensão da nuvem de pontos ou processe uma área menor.'
+                'A largura projetada da nuvem excede o limite de análise local. '
+                'Confira o CRS e a extensão da imagem selecionada.'
             )
-        while station_count * cross_bin_count > cell_limit or station_count > 200000:
+        while station_count > 200000:
             station_step *= 1.25
             station_count = max(1, int(math.ceil(along_length / station_step)) + 1)
-        density = np.zeros((station_count, cross_bin_count), dtype=np.uint32)
         feedback.pushInfo(
-            f'Construindo grade de densidade local ({station_step:.2f} m por estação, '
-            f'{cross_bin_size:.2f} m transversal)...'
+            f'Acumulando pontos em células esparsas ({station_count} estações de '
+            f'{station_step:.2f} m; passo transversal de {cross_bin_size:.2f} m)...'
         )
-        self._accumulate_density(
+        density_indices, density_counts = self._accumulate_density(
             points, along, across, along_min, cross_min, station_step,
-            cross_bin_size, density, image_extent, point_count, feedback,
+            cross_bin_size, cross_bin_count, image_extent, point_count, feedback,
         )
         if feedback.isCanceled():
             return {}
@@ -187,7 +185,18 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                 feedback.setProgress(40 + 25 * station_index / station_count)
             lo = max(0, station_index - support_half_bins)
             hi = min(station_count, station_index + support_half_bins + 1)
-            profile = density[lo:hi].sum(axis=0, dtype=np.uint64).astype(np.float64)
+            first = np.searchsorted(
+                density_indices, lo * cross_bin_count, side='left'
+            )
+            last = np.searchsorted(
+                density_indices, hi * cross_bin_count, side='left'
+            )
+            cross_bins = density_indices[first:last] % cross_bin_count
+            profile = np.bincount(
+                cross_bins,
+                weights=density_counts[first:last],
+                minlength=cross_bin_count,
+            )
             centers = self._find_row_centers(
                 profile, cross_min, cross_bin_size, spacing, min_points
             )
@@ -204,8 +213,23 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         )
         if feedback.isCanceled():
             return {}
+        stations_with_candidates = sum(
+            bool(candidates) for candidates in candidates_by_station
+        )
+        max_candidates = max(
+            (len(candidates) for candidates in candidates_by_station), default=0
+        )
+        feedback.pushInfo(
+            f'Estações com fileiras candidatas: {stations_with_candidates}/{station_count}; '
+            f'máximo de candidatos numa estação: {max_candidates}.'
+        )
         viable_tracks = [track for track in row_tracks if len(track) >= 3]
         if len(viable_tracks) < 2:
+            feedback.pushInfo(
+                f'Diagnóstico: orientação global {angle:.2f}°, passo longitudinal '
+                f'{station_step:.2f} m, trilhas temporais {len(row_tracks)}, '
+                f'trilhas com pelo menos três estações {len(viable_tracks)}.'
+            )
             raise QgsProcessingException(
                 'Não foram identificadas pelo menos duas fileiras contínuas. Confira '
                 'o espaçamento informado e a classificação da nuvem.'
@@ -474,30 +498,41 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
 
     def _accumulate_density(
             self, layer, along, across, along_min, cross_min, station_step,
-            cross_bin_size, density, extent, total_points, feedback):
+            cross_bin_size, cross_bin_count, extent, total_points, feedback):
         processed_points = 0
+        index_batches = []
+        count_batches = []
         for coordinates in self._coordinate_batches(layer, extent):
             if feedback.isCanceled():
-                return
+                return None, None
             processed_points += len(coordinates)
             t = coordinates @ along
             s = coordinates @ across
             station_index = np.floor((t - along_min) / station_step).astype(np.int64)
             cross_index = np.floor((s - cross_min) / cross_bin_size).astype(np.int64)
             valid = (
-                (station_index >= 0) & (station_index < density.shape[0])
-                & (cross_index >= 0) & (cross_index < density.shape[1])
+                (station_index >= 0)
+                & (cross_index >= 0) & (cross_index < cross_bin_count)
             )
-            if not np.any(valid):
-                continue
-            flat_indices = (
-                station_index[valid] * density.shape[1] + cross_index[valid]
-            )
-            unique_indices, counts = np.unique(flat_indices, return_counts=True)
-            density.flat[unique_indices] += counts.astype(np.uint32)
+            if np.any(valid):
+                flat_indices = (
+                    station_index[valid] * cross_bin_count + cross_index[valid]
+                )
+                unique_indices, counts = np.unique(
+                    flat_indices, return_counts=True
+                )
+                index_batches.append(unique_indices)
+                count_batches.append(counts.astype(np.uint32))
             feedback.setProgress(
                 15 + 25 * min(processed_points, total_points) / max(1, total_points)
             )
+        if not index_batches:
+            return np.asarray([], dtype=np.int64), np.asarray([], dtype=np.uint32)
+        indices = np.concatenate(index_batches)
+        counts = np.concatenate(count_batches)
+        unique_indices, inverse = np.unique(indices, return_inverse=True)
+        merged_counts = np.bincount(inverse, weights=counts).astype(np.uint32)
+        return unique_indices, merged_counts
 
     def _weighted_center(self, profile, center, start, bin_size, radius):
         center_index = int(round((center - start) / bin_size))

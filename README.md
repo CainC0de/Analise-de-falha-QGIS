@@ -60,8 +60,9 @@ longitudinal, a densidade mínima para reconhecer um centro e a maior lacuna que
 pode ser interpolada podem ser ajustados. Os picos são escolhidos respeitando a
 grade de plantio para reduzir duplicações; os centros locais e a associação de
 estações sucessivas permitem que as linhas acompanhem curvas graduais. A etapa
-usa apenas os pontos que caem na extensão do raster e grava a saída no CRS
-métrico da nuvem.
+usa acumulação esparsa para preservar o passo de análise sem alocar uma grade
+densa para toda a área. Também lê apenas os pontos que caem na extensão do raster
+e grava a saída no CRS métrico da nuvem.
 
 ## Base metodológica e limites
 
