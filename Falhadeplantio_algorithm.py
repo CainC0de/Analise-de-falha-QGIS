@@ -1,5 +1,6 @@
 """Initial RGB vegetation classification algorithm for the QGIS plugin."""
 
+import math
 import os
 import tempfile
 
@@ -33,6 +34,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
     GREEN_BAND = 'GREEN_BAND'
     BLUE_BAND = 'BLUE_BAND'
     PIXEL_SIZE_CM = 'PIXEL_SIZE_CM'
+    POINT_SPACING_CM = 'POINT_SPACING_CM'
     GLI_THRESHOLD = 'GLI_THRESHOLD'
     OUTPUT = 'OUTPUT'
     OUTPUT_POINTS = 'OUTPUT_POINTS'
@@ -56,6 +58,14 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             type=QgsProcessingParameterNumber.Double,
             defaultValue=3.0,
             minValue=0.01,
+        ))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.POINT_SPACING_CM,
+            'Espaçamento aproximado entre pontos da nuvem (cm)',
+            type=QgsProcessingParameterNumber.Double,
+            defaultValue=10.0,
+            minValue=1.0,
+            maxValue=1000.0,
         ))
         self.addParameter(QgsProcessingParameterNumber(
             self.GLI_THRESHOLD,
@@ -84,6 +94,9 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         if not crs.isValid():
             raise QgsProcessingException('O raster não tem um CRS válido definido.')
         pixel_cm = self.parameterAsDouble(parameters, self.PIXEL_SIZE_CM, context)
+        point_spacing_cm = self.parameterAsDouble(
+            parameters, self.POINT_SPACING_CM, context
+        )
 
         output_crs = crs
         reproject_to_utm = (
@@ -234,6 +247,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             point_fields = QgsFields()
             point_fields.append(QgsField('gli', QVariant.Double, len=12, prec=7))
             point_fields.append(QgsField('classe', QVariant.Int))
+            point_fields.append(QgsField('pixel_count', QVariant.Int))
             point_sink, point_destination = self.parameterAsSink(
                 parameters,
                 self.OUTPUT_POINTS,
@@ -247,11 +261,51 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
                 rgb = None
                 raise QgsProcessingException('Não foi possível criar a nuvem de pontos.')
 
-            block_rows = 256
-            nodata_values = [rgb.GetRasterBand(i).GetNoDataValue() for i in (1, 2, 3)]
             geotransform = rgb.GetGeoTransform()
-            point_batch = []
-            point_count = 0
+            pixel_width = math.hypot(geotransform[1], geotransform[4])
+            pixel_height = math.hypot(geotransform[2], geotransform[5])
+            if pixel_width <= 0 or pixel_height <= 0:
+                result = None
+                rgb = None
+                raise QgsProcessingException('O raster reamostrado tem pixels inválidos.')
+            requested_spacing_m = point_spacing_cm / 100.0
+            pixel_size_m = min(pixel_width, pixel_height)
+            point_stride = max(1, int(math.ceil(requested_spacing_m / pixel_size_m)))
+            grid_rows = int(math.ceil(out_height / point_stride))
+            grid_columns = int(math.ceil(out_width / point_stride))
+            max_grid_cells = 2000000
+            while grid_rows * grid_columns > max_grid_cells:
+                scale_up = math.sqrt(grid_rows * grid_columns / max_grid_cells)
+                point_stride = max(
+                    point_stride + 1,
+                    int(math.ceil(point_stride * scale_up)),
+                )
+                grid_rows = int(math.ceil(out_height / point_stride))
+                grid_columns = int(math.ceil(out_width / point_stride))
+            effective_spacing_cm = point_stride * pixel_size_m * 100.0
+            feedback.pushInfo(
+                f'Nuvem representativa: espaçamento aproximado '
+                f'{effective_spacing_cm:.1f} cm; classificação mantém resolução '
+                f'{pixel_cm:g} cm.'
+            )
+
+            # Keep one compact accumulator per output point cell. The dense
+            # pixel classification stays full resolution; only the auxiliary
+            # vector point cloud is spatially sampled for processing speed.
+            cell_total = grid_rows * grid_columns
+            point_counts = np.zeros(cell_total, dtype=np.uint32)
+            point_row_sums = np.zeros(cell_total, dtype=np.float64)
+            point_column_sums = np.zeros(cell_total, dtype=np.float64)
+            point_gli_sums = np.zeros(cell_total, dtype=np.float64)
+
+            block_rows = 256
+            block_columns = 1024
+            nodata_values = [rgb.GetRasterBand(i).GetNoDataValue() for i in (1, 2, 3)]
+            tile_count = (
+                int(math.ceil(out_height / block_rows))
+                * int(math.ceil(out_width / block_columns))
+            )
+            tile_index = 0
             for row in range(0, out_height, block_rows):
                 if feedback.isCanceled():
                     result = None
@@ -262,47 +316,98 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
                         pass
                     return {}
                 rows = min(block_rows, out_height - row)
-                red = rgb.GetRasterBand(1).ReadAsArray(0, row, out_width, rows)
-                green = rgb.GetRasterBand(2).ReadAsArray(0, row, out_width, rows)
-                blue = rgb.GetRasterBand(3).ReadAsArray(0, row, out_width, rows)
-                denominator = 2.0 * green + red + blue
-                gli = np.zeros(denominator.shape, dtype=np.float32)
-                np.divide(2.0 * green - red - blue, denominator,
-                          out=gli, where=denominator != 0)
-                vegetation = (gli > threshold).astype(np.uint8)
-                valid = np.isfinite(red) & np.isfinite(green) & np.isfinite(blue)
-                for data, nodata in zip((red, green, blue), nodata_values):
-                    if nodata is not None:
-                        valid &= data != nodata
-                vegetation[~valid] = 255
-                result_band.WriteArray(vegetation, 0, row)
+                for column in range(0, out_width, block_columns):
+                    if feedback.isCanceled():
+                        result = None
+                        rgb = None
+                        try:
+                            os.remove(output_path)
+                        except OSError:
+                            pass
+                        return {}
+                    columns = min(block_columns, out_width - column)
+                    red = rgb.GetRasterBand(1).ReadAsArray(column, row, columns, rows)
+                    green = rgb.GetRasterBand(2).ReadAsArray(column, row, columns, rows)
+                    blue = rgb.GetRasterBand(3).ReadAsArray(column, row, columns, rows)
+                    denominator = 2.0 * green + red + blue
+                    gli = np.zeros(denominator.shape, dtype=np.float32)
+                    np.divide(2.0 * green - red - blue, denominator,
+                              out=gli, where=denominator != 0)
+                    vegetation = np.zeros(denominator.shape, dtype=np.uint8)
+                    vegetation[gli > threshold] = 1
+                    valid = np.isfinite(red) & np.isfinite(green) & np.isfinite(blue)
+                    for data, nodata in zip((red, green, blue), nodata_values):
+                        if nodata is not None:
+                            valid &= data != nodata
+                    vegetation[~valid] = 255
+                    result_band.WriteArray(vegetation, column, row)
 
-                for local_row in range(rows):
-                    green_columns = np.flatnonzero(vegetation[local_row] == 1)
-                    y = (geotransform[3] + (row + local_row + 0.5) * geotransform[5]
-                         + 0.5 * geotransform[4])
-                    for column in green_columns:
-                        x = (geotransform[0] + (column + 0.5) * geotransform[1]
-                             + (row + local_row + 0.5) * geotransform[2])
-                        feature = QgsFeature(point_fields)
-                        feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(x, y)))
-                        feature.setAttributes([float(gli[local_row, column]), 1])
-                        point_batch.append(feature)
-                        point_count += 1
-                        if len(point_batch) >= 5000:
-                            if not point_sink.addFeatures(
-                                    point_batch, QgsFeatureSink.FastInsert):
-                                raise QgsProcessingException(
-                                    'Erro ao gravar pontos da cultura no GeoPackage.'
-                                )
-                            point_batch = []
-                feedback.setProgress(100.0 * min(row + rows, out_height) / out_height)
+                    local_rows, local_columns = np.nonzero(vegetation == 1)
+                    if local_rows.size:
+                        global_rows = row + local_rows
+                        global_columns = column + local_columns
+                        cell_ids = (
+                            (global_rows // point_stride) * grid_columns
+                            + global_columns // point_stride
+                        )
+                        unique_ids, inverse = np.unique(cell_ids, return_inverse=True)
+                        counts = np.bincount(inverse).astype(np.uint32)
+                        point_counts[unique_ids] += counts
+                        point_row_sums[unique_ids] += np.bincount(
+                            inverse, weights=global_rows
+                        )
+                        point_column_sums[unique_ids] += np.bincount(
+                            inverse, weights=global_columns
+                        )
+                        point_gli_sums[unique_ids] += np.bincount(
+                            inverse, weights=gli[local_rows, local_columns]
+                        )
+                    tile_index += 1
+                    feedback.setProgress(80.0 * tile_index / max(1, tile_count))
 
+            occupied_cells = np.flatnonzero(point_counts)
+            point_batch = []
+            point_count = 0
+            for cell_id in occupied_cells:
+                if point_count % 5000 == 0 and feedback.isCanceled():
+                    result = None
+                    rgb = None
+                    try:
+                        os.remove(output_path)
+                    except OSError:
+                        pass
+                    return {}
+                count = int(point_counts[cell_id])
+                pixel_row = point_row_sums[cell_id] / count
+                pixel_column = point_column_sums[cell_id] / count
+                x = (geotransform[0] + (pixel_column + 0.5) * geotransform[1]
+                     + (pixel_row + 0.5) * geotransform[2])
+                y = (geotransform[3] + (pixel_column + 0.5) * geotransform[4]
+                     + (pixel_row + 0.5) * geotransform[5])
+                feature = QgsFeature(point_fields)
+                feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(x, y)))
+                feature.setAttributes([
+                    float(point_gli_sums[cell_id] / count), 1, count
+                ])
+                point_batch.append(feature)
+                point_count += 1
+                if len(point_batch) >= 5000:
+                    if not point_sink.addFeatures(
+                            point_batch, QgsFeatureSink.FastInsert):
+                        raise QgsProcessingException(
+                            'Erro ao gravar pontos da cultura no GeoPackage.'
+                        )
+                    point_batch = []
+                if point_count % 5000 == 0:
+                    feedback.setProgress(
+                        80.0 + 20.0 * point_count / max(1, len(occupied_cells))
+                    )
             if point_batch and not point_sink.addFeatures(
                     point_batch, QgsFeatureSink.FastInsert):
                 raise QgsProcessingException(
                     'Erro ao gravar os últimos pontos da cultura no GeoPackage.'
                 )
+            feedback.setProgress(100.0)
             point_sink = None
 
             result_band.FlushCache()
@@ -340,7 +445,9 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             'Escolha as bandas R, G e B conforme a ordem do seu raster, informe o '
             'limiar GLI e o tamanho de pixel de saída em centímetros. O algoritmo '
             'grava a classificação em GeoTIFF e cria uma camada de pontos GeoPackage '
-            'com um ponto no centro de cada pixel verde classificado. O raster precisa '
+            'com pontos representativos agregados em células espaciais. O raster mantém '
+            'todos os pixels classificados; ajuste o espaçamento dos pontos para equilibrar '
+            'detalhe e velocidade. O raster precisa '
             'usar um CRS definido. Se estiver em graus ou unidades não métricas, '
             'a saída será reprojetada automaticamente para a zona UTM local.\n\n'
             'A resolução de saída define o espaçamento dos pixels e não aumenta o '

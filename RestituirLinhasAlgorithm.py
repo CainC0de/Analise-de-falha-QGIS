@@ -18,6 +18,7 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsProcessingParameterRasterLayer,
     QgsProcessingParameterVectorLayer,
+    QgsFeatureRequest,
     QgsCoordinateTransform,
     QgsFeatureSink,
     QgsUnitTypes,
@@ -55,7 +56,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         ))
         self.addParameter(QgsProcessingParameterNumber(
             self.MAX_DEVIATION,
-            'Largura máxima para associar pontos à linha (m)',
+            'Deslocamento lateral máximo por metro longitudinal (m/m)',
             type=QgsProcessingParameterNumber.Double,
             defaultValue=0.65,
             minValue=0.05,
@@ -63,7 +64,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         ))
         self.addParameter(QgsProcessingParameterNumber(
             self.MAX_GAP,
-            'Maior intervalo entre pontos para manter a linha contínua (m)',
+            'Maior lacuna longitudinal que pode ser interpolada (m)',
             type=QgsProcessingParameterNumber.Double,
             defaultValue=3.0,
             minValue=0.5,
@@ -71,7 +72,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         ))
         self.addParameter(QgsProcessingParameterNumber(
             self.MIN_POINTS_PER_BIN,
-            'Mínimo de pontos para sustentar cada trecho (filtro de ruído)',
+            'Mínimo de pontos na densidade local para reconhecer a fileira',
             type=QgsProcessingParameterNumber.Integer,
             defaultValue=4,
             minValue=1,
@@ -119,16 +120,22 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         max_deviation = self.parameterAsDouble(parameters, self.MAX_DEVIATION, context)
         max_gap = self.parameterAsDouble(parameters, self.MAX_GAP, context)
         min_points = self.parameterAsInt(parameters, self.MIN_POINTS_PER_BIN, context)
-        point_count = points.featureCount()
-        if point_count < 10:
-            raise QgsProcessingException(
-                'A nuvem tem poucos pontos para identificar a orientação das linhas.'
-            )
-
-        feedback.pushInfo('Amostrando os pontos para estimar a orientação predominante...')
-        sample, bounds = self._sample_points(points, feedback)
+        feedback.pushInfo(
+            'Selecionando somente os pontos dentro da imagem e amostrando a orientação...'
+        )
+        sample, bounds, point_count = self._sample_points(
+            points, image_extent, feedback
+        )
         if feedback.isCanceled():
             return {}
+        if point_count < 10:
+            raise QgsProcessingException(
+                'Há menos de dez pontos da nuvem dentro da imagem selecionada.'
+            )
+        feedback.pushInfo(
+            f'Pontos dentro da imagem: {point_count}; usados na amostra angular: '
+            f'{len(sample)}.'
+        )
         sample_array = np.asarray(sample, dtype=np.float64)
         if sample_array.shape[0] < 10 or not all(math.isfinite(v) for v in bounds):
             raise QgsProcessingException('Não há pontos válidos suficientes na nuvem.')
@@ -140,42 +147,70 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         across = np.array([-math.sin(radians), math.cos(radians)])
         feedback.pushInfo(f'Orientação predominante estimada: {angle:.2f}°.')
 
-        feedback.pushInfo('Localizando os centros das linhas de plantio...')
-        normal_min, normal_max = self._projected_bounds(bounds, across)
-        profile_size = max(2, int(math.ceil((normal_max - normal_min) / bin_size)) + 1)
-        profile = np.zeros(profile_size, dtype=np.float64)
-        self._fill_profile(points, across, normal_min, bin_size, profile, feedback)
-        if feedback.isCanceled():
-            return {}
-        centers = self._find_row_centers(profile, normal_min, bin_size, spacing)
-        if len(centers) < 2:
-            raise QgsProcessingException(
-                'Não foram identificadas pelo menos duas linhas. Confira o '
-                'espaçamento informado e a classificação da nuvem.'
-            )
-        feedback.pushInfo(f'Linhas candidatas identificadas: {len(centers)}.')
-
         along_min, along_max = self._projected_bounds(bounds, along)
-        along_bin = 0.50
-        along_count = max(1, int(math.ceil((along_max - along_min) / along_bin)) + 1)
+        cross_min, cross_max = self._projected_bounds(bounds, across)
+        station_step = 0.50
         cross_bin_size = 0.05
-        cross_bin_count = int(math.ceil(2.0 * max_deviation / cross_bin_size)) + 1
-        histogram_size = len(centers) * along_count * cross_bin_count
-        if histogram_size > 40000000:
-            raise QgsProcessingException(
-                'A grade robusta de restituição ficou grande demais. Processe uma '
-                'área menor ou aumente o tamanho do pixel na classificação.'
-            )
-        cross_histogram = np.zeros(
-            (len(centers), along_count, cross_bin_count), dtype=np.uint32
+        cross_bin_count = max(
+            2, int(math.ceil((cross_max - cross_min) / cross_bin_size)) + 1
         )
-        feedback.pushInfo('Ajustando cada linha aos pontos da cultura...')
-        self._accumulate_rows(
-            points, centers, along, across, along_min, along_bin,
-            max_deviation, cross_bin_size, cross_histogram, feedback,
+        along_length = max(0.0, along_max - along_min)
+        station_count = max(1, int(math.ceil(along_length / station_step)) + 1)
+        cell_limit = 20000000
+        if cross_bin_count > cell_limit:
+            raise QgsProcessingException(
+                'A largura da área é grande demais para a grade local. Confira '
+                'a extensão da nuvem de pontos ou processe uma área menor.'
+            )
+        while station_count * cross_bin_count > cell_limit or station_count > 200000:
+            station_step *= 1.25
+            station_count = max(1, int(math.ceil(along_length / station_step)) + 1)
+        density = np.zeros((station_count, cross_bin_count), dtype=np.uint32)
+        feedback.pushInfo(
+            f'Construindo grade de densidade local ({station_step:.2f} m por estação, '
+            f'{cross_bin_size:.2f} m transversal)...'
+        )
+        self._accumulate_density(
+            points, along, across, along_min, cross_min, station_step,
+            cross_bin_size, density, image_extent, point_count, feedback,
         )
         if feedback.isCanceled():
             return {}
+
+        feedback.pushInfo('Rastreando os centros das fileiras ao longo do campo...')
+        candidates_by_station = []
+        support_half_bins = max(1, int(round(0.75 / station_step)))
+        for station_index in range(station_count):
+            if station_index % 20 == 0:
+                if feedback.isCanceled():
+                    return {}
+                feedback.setProgress(40 + 25 * station_index / station_count)
+            lo = max(0, station_index - support_half_bins)
+            hi = min(station_count, station_index + support_half_bins + 1)
+            profile = density[lo:hi].sum(axis=0, dtype=np.uint64).astype(np.float64)
+            centers = self._find_row_centers(
+                profile, cross_min, cross_bin_size, spacing, min_points
+            )
+            candidates_by_station.append([
+                self._weighted_center(
+                    profile, center, cross_min, cross_bin_size,
+                    min(0.30, spacing * 0.25),
+                )
+                for center in centers
+            ])
+        row_tracks = self._track_rows(
+            candidates_by_station, station_step, spacing, max_deviation, max_gap,
+            feedback,
+        )
+        if feedback.isCanceled():
+            return {}
+        viable_tracks = [track for track in row_tracks if len(track) >= 3]
+        if len(viable_tracks) < 2:
+            raise QgsProcessingException(
+                'Não foram identificadas pelo menos duas fileiras contínuas. Confira '
+                'o espaçamento informado e a classificação da nuvem.'
+            )
+        feedback.pushInfo(f'Fileiras acompanhadas localmente: {len(viable_tracks)}.')
 
         fields = QgsFields()
         fields.append(QgsField('linha_id', QVariant.Int))
@@ -189,34 +224,26 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException('Não foi possível criar a camada de linhas.')
 
         output_id = 0
-        for row_id, _center in enumerate(centers, start=1):
+        for track in viable_tracks:
             if feedback.isCanceled():
                 return {}
-            histogram = cross_histogram[row_id - 1]
-            row_counts = histogram.sum(axis=1)
-            observed = np.flatnonzero(row_counts >= min_points)
-            if observed.size < 2:
-                continue
-            breaks = np.flatnonzero(np.diff(observed) * along_bin > max_gap)
-            groups = np.split(observed, breaks + 1)
+            observed = np.asarray([item[0] for item in track], dtype=np.int64)
+            observed_offsets = np.asarray([item[1] for item in track], dtype=np.float64)
+            breaks = np.flatnonzero(np.diff(observed) * station_step > max_gap)
+            groups = np.split(np.arange(len(observed)), breaks + 1)
             for group in groups:
-                if group.size < 2:
+                if group.size < 3:
                     continue
-                start, end = int(group[0]), int(group[-1])
+                group_indices = observed[group]
+                start, end = int(group_indices[0]), int(group_indices[-1])
                 bins = np.arange(start, end + 1)
-                group_histogram = histogram[group]
-                cumulative = np.cumsum(group_histogram, axis=1)
-                halfway = (row_counts[group, None] + 1) // 2
-                median_bins = np.argmax(cumulative >= halfway, axis=1)
-                observed_offsets = (
-                    centers[row_id - 1] - max_deviation
-                    + median_bins * cross_bin_size
+                fitted = np.interp(
+                    bins, group_indices, observed_offsets[group]
                 )
-                fitted = np.interp(bins, group, observed_offsets)
                 fitted = self._smooth(fitted, window=3)
                 line_points = []
                 for index, offset in zip(bins, fitted):
-                    t = along_min + index * along_bin
+                    t = along_min + index * station_step
                     s = float(offset)
                     x = along[0] * t + across[0] * s
                     y = along[1] * t + across[1] * s
@@ -225,30 +252,33 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                     continue
                 geometry = QgsGeometry.fromPolylineXY(line_points)
                 length = geometry.length()
-                if length <= 0:
+                if length < 2.0:
                     continue
                 feature = QgsFeature(fields)
                 feature.setGeometry(geometry)
-                feature.setAttributes([row_id, angle % 180.0, length])
+                feature.setAttributes([output_id + 1, angle % 180.0, length])
                 if not sink.addFeature(feature, QgsFeatureSink.FastInsert):
                     raise QgsProcessingException('Falha ao gravar uma linha restituída.')
                 output_id += 1
 
         feedback.pushInfo(
             f'Restituição concluída: {output_id} segmento(s) de linha criado(s). '
-            'Cada linha foi ajustada individualmente à distribuição local dos pontos.'
+            'Cada traçado acompanha o centro local da fileira ao longo do campo.'
         )
         return {self.OUTPUT: destination}
 
-    def _sample_points(self, layer, feedback):
+    def _sample_points(self, layer, extent, feedback):
         rng = random.Random(207)
         sample = []
         total = 0
         xmin = ymin = float('inf')
         xmax = ymax = float('-inf')
-        for feature in layer.getFeatures():
+        request = QgsFeatureRequest()
+        request.setNoAttributes()
+        request.setFilterRect(extent)
+        for feature in layer.getFeatures(request):
             if total % 50000 == 0 and feedback.isCanceled():
-                return sample, (xmin, ymin, xmax, ymax)
+                return sample, (xmin, ymin, xmax, ymax), total
             geometry = feature.geometry()
             if geometry is None or geometry.isNull() or geometry.isEmpty():
                 continue
@@ -266,13 +296,21 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                 index = rng.randrange(total)
                 if index < self.SAMPLE_LIMIT:
                     sample[index] = coordinate
-        return sample, (xmin, ymin, xmax, ymax)
+        return sample, (xmin, ymin, xmax, ymax), total
 
     def _estimate_orientation(self, sample, spacing, bin_size):
         best_angle = 0.0
         best_score = float('-inf')
         lag_min = max(1, int(round((spacing - 0.25) / bin_size)))
         lag_max = max(lag_min, int(round((spacing + 0.25) / bin_size)))
+        short_lag_min = max(1, int(round(0.20 / bin_size)))
+        short_lag_max = max(
+            short_lag_min,
+            min(
+                lag_min - 1,
+                int(round(min(spacing * 0.60, spacing - 0.10) / bin_size)),
+            ),
+        )
         for angle in np.arange(0.0, 180.0, 1.0):
             radians = math.radians(angle)
             normal = np.array([-math.sin(radians), math.cos(radians)])
@@ -295,7 +333,16 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             for lag in range(lag_min, min(lag_max, len(centered) - 1) + 1):
                 score = float(np.dot(centered[:-lag], centered[lag:]) / energy)
                 periodicity = max(periodicity, score)
-            score = peakiness * max(0.0, periodicity)
+            shorter_periodicity = 0.0
+            for lag in range(
+                    short_lag_min, min(short_lag_max, len(centered) - 1) + 1):
+                score = float(np.dot(centered[:-lag], centered[lag:]) / energy)
+                shorter_periodicity = max(shorter_periodicity, score)
+            # Cane rows repeat at the inter-row spacing. Penalizing strong
+            # shorter repeats helps distinguish that spacing from repeated
+            # plants along a row (a common source of 90-degree errors).
+            fundamental = periodicity - 0.45 * max(0.0, shorter_periodicity)
+            score = peakiness * max(0.0, fundamental)
             if score > best_score:
                 best_score, best_angle = score, float(angle)
         return best_angle
@@ -308,35 +355,31 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         projected = corners @ vector
         return float(projected.min()), float(projected.max())
 
-    def _fill_profile(self, layer, vector, start, bin_size, profile, feedback):
-        for coordinates in self._coordinate_batches(layer):
-            if feedback.isCanceled():
-                return
-            values = coordinates @ vector
-            indices = np.floor((values - start) / bin_size).astype(np.int64)
-            indices = np.clip(indices, 0, len(profile) - 1)
-            profile += np.bincount(indices, minlength=len(profile))
-
-    def _find_row_centers(self, profile, start, bin_size, spacing):
+    def _find_row_centers(self, profile, start, bin_size, spacing, min_points):
         if len(profile) < 3:
             return []
         width = min(len(profile), max(1, int(round(0.35 / bin_size))))
         kernel = np.ones(width, dtype=np.float64) / width
         smoothed = np.convolve(profile, kernel, mode='same')
         minimum_distance = max(1, int(round(spacing * 0.68 / bin_size)))
-        local_maxima = [
-            index for index in range(1, len(smoothed) - 1)
-            if smoothed[index] >= smoothed[index - 1]
-            and smoothed[index] > smoothed[index + 1]
-            and smoothed[index] > 0
-        ]
+        local_maxima = (
+            np.flatnonzero(
+                (smoothed[1:-1] >= smoothed[:-2])
+                & (smoothed[1:-1] > smoothed[2:])
+                & (smoothed[1:-1] > 0)
+            ) + 1
+        ).tolist()
         if smoothed[0] > smoothed[1] and smoothed[0] > 0:
             local_maxima.append(0)
         if smoothed[-1] > smoothed[-2] and smoothed[-1] > 0:
             local_maxima.append(len(smoothed) - 1)
         if not local_maxima:
             return []
-        peak_floor = max(float(smoothed.max()) * 0.08, float(np.median(smoothed)) * 1.15)
+        peak_floor = max(
+            float(min_points),
+            float(smoothed.max()) * 0.05,
+            float(np.median(smoothed)) * 1.15,
+        )
         candidates = [i for i in local_maxima if smoothed[i] >= peak_floor]
         if not candidates:
             return []
@@ -344,41 +387,80 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         # Anchor a row-spacing lattice on each plausible peak. Choosing one
         # strongest, regularly spaced sequence suppresses duplicate peaks from
         # dense patches or weeds inside a single planted row.
-        tolerance = max(minimum_distance // 2, int(round(spacing * 0.28 / bin_size)))
+        tolerance = max(2, int(round(spacing * 0.15 / bin_size)))
         spacing_bins = spacing / bin_size
-        best_sequence = []
-        best_strength = float('-inf')
-        for anchor in candidates:
-            sequence = [anchor]
-            for direction in (-1, 1):
-                current = anchor
-                while True:
-                    target = current + direction * spacing_bins
-                    options = [
-                        peak for peak in candidates
-                        if direction * (peak - current) >= minimum_distance
-                        and abs(peak - target) <= tolerance
-                    ]
-                    if not options:
-                        break
-                    chosen = min(
-                        options,
-                        key=lambda peak: abs(peak - target)
-                        - 0.02 * smoothed[peak] / (smoothed.max() + 1e-9),
-                    )
-                    if chosen in sequence:
-                        break
-                    sequence.append(chosen)
-                    current = chosen
-            strength = len(sequence) * 1e6 + sum(smoothed[i] for i in sequence)
-            if strength > best_strength:
-                best_sequence, best_strength = sequence, strength
-        selected = sorted(set(best_sequence))
+        candidate_array = np.asarray(sorted(candidates), dtype=np.int64)
+        peak_strength = smoothed[candidate_array]
+        count = len(candidate_array)
+        minimum_step = max(minimum_distance, spacing_bins - tolerance)
+        maximum_step = spacing_bins + tolerance
+        left_length = np.ones(count, dtype=np.int32)
+        left_strength = peak_strength.copy()
+        left_parent = np.full(count, -1, dtype=np.int64)
+        for index in range(count):
+            lo = np.searchsorted(
+                candidate_array, candidate_array[index] - maximum_step, side='left'
+            )
+            hi = np.searchsorted(
+                candidate_array, candidate_array[index] - minimum_step, side='right'
+            )
+            for previous in range(lo, hi):
+                length = left_length[previous] + 1
+                strength = left_strength[previous] + peak_strength[index]
+                if (length > left_length[index]
+                        or (length == left_length[index]
+                            and strength > left_strength[index])):
+                    left_length[index] = length
+                    left_strength[index] = strength
+                    left_parent[index] = previous
+
+        right_length = np.ones(count, dtype=np.int32)
+        right_strength = peak_strength.copy()
+        right_next = np.full(count, -1, dtype=np.int64)
+        for index in range(count - 1, -1, -1):
+            lo = np.searchsorted(
+                candidate_array, candidate_array[index] + minimum_step, side='left'
+            )
+            hi = np.searchsorted(
+                candidate_array, candidate_array[index] + maximum_step, side='right'
+            )
+            for following in range(lo, hi):
+                length = right_length[following] + 1
+                strength = right_strength[following] + peak_strength[index]
+                if (length > right_length[index]
+                        or (length == right_length[index]
+                            and strength > right_strength[index])):
+                    right_length[index] = length
+                    right_strength[index] = strength
+                    right_next[index] = following
+
+        anchor = max(
+            range(count),
+            key=lambda index: (
+                left_length[index] + right_length[index] - 1,
+                left_strength[index] + right_strength[index] - peak_strength[index],
+            ),
+        )
+        left_path = []
+        cursor = anchor
+        while cursor >= 0:
+            left_path.append(cursor)
+            cursor = int(left_parent[cursor])
+        left_path.reverse()
+        selected_indices = list(left_path)
+        cursor = int(right_next[anchor])
+        while cursor >= 0:
+            selected_indices.append(cursor)
+            cursor = int(right_next[cursor])
+        selected = candidate_array[selected_indices]
         return [start + index * bin_size for index in selected]
 
-    def _coordinate_batches(self, layer):
+    def _coordinate_batches(self, layer, extent):
         batch = []
-        for feature in layer.getFeatures():
+        request = QgsFeatureRequest()
+        request.setNoAttributes()
+        request.setFilterRect(extent)
+        for feature in layer.getFeatures(request):
             geometry = feature.geometry()
             if geometry is None or geometry.isNull() or geometry.isEmpty():
                 continue
@@ -390,36 +472,114 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         if batch:
             yield np.asarray(batch, dtype=np.float64)
 
-    def _accumulate_rows(
-            self, layer, centers, along, across, along_min, along_bin,
-            max_deviation, cross_bin_size, cross_histogram, feedback):
-        centers_array = np.asarray(centers)
-        for coordinates in self._coordinate_batches(layer):
+    def _accumulate_density(
+            self, layer, along, across, along_min, cross_min, station_step,
+            cross_bin_size, density, extent, total_points, feedback):
+        processed_points = 0
+        for coordinates in self._coordinate_batches(layer, extent):
             if feedback.isCanceled():
                 return
+            processed_points += len(coordinates)
             t = coordinates @ along
             s = coordinates @ across
-            right = np.searchsorted(centers_array, s, side='left')
-            left = np.clip(right - 1, 0, len(centers_array) - 1)
-            right_clipped = np.clip(right, 0, len(centers_array) - 1)
-            use_right = np.abs(s - centers_array[right_clipped]) < np.abs(s - centers_array[left])
-            row = np.where(use_right, right_clipped, left)
-            offset = np.abs(s - centers_array[row])
-            valid = offset <= max_deviation
-            along_index = np.floor((t - along_min) / along_bin).astype(np.int64)
-            valid &= (along_index >= 0) & (along_index < cross_histogram.shape[1])
+            station_index = np.floor((t - along_min) / station_step).astype(np.int64)
+            cross_index = np.floor((s - cross_min) / cross_bin_size).astype(np.int64)
+            valid = (
+                (station_index >= 0) & (station_index < density.shape[0])
+                & (cross_index >= 0) & (cross_index < density.shape[1])
+            )
             if not np.any(valid):
                 continue
-            cross_index = np.floor(
-                (s[valid] - centers_array[row[valid]] + max_deviation)
-                / cross_bin_size
-            ).astype(np.int64)
-            cross_index = np.clip(cross_index, 0, cross_histogram.shape[2] - 1)
-            np.add.at(
-                cross_histogram,
-                (row[valid], along_index[valid], cross_index),
-                1,
+            flat_indices = (
+                station_index[valid] * density.shape[1] + cross_index[valid]
             )
+            unique_indices, counts = np.unique(flat_indices, return_counts=True)
+            density.flat[unique_indices] += counts.astype(np.uint32)
+            feedback.setProgress(
+                15 + 25 * min(processed_points, total_points) / max(1, total_points)
+            )
+
+    def _weighted_center(self, profile, center, start, bin_size, radius):
+        center_index = int(round((center - start) / bin_size))
+        half_bins = max(1, int(round(radius / bin_size)))
+        lo = max(0, center_index - half_bins)
+        hi = min(len(profile), center_index + half_bins + 1)
+        weights = profile[lo:hi]
+        total = float(weights.sum())
+        if total <= 0:
+            return center
+        median_index = int(np.searchsorted(np.cumsum(weights), total * 0.5))
+        return start + (lo + median_index + 0.5) * bin_size
+
+    def _track_rows(
+            self, candidates_by_station, station_step, spacing,
+            max_deviation, max_gap, feedback):
+        tracks = []
+        active_track_indices = []
+        gap_limit = max(1, int(math.ceil(max_gap / station_step)))
+        for station_index, candidates in enumerate(candidates_by_station):
+            if station_index % 20 == 0:
+                if feedback.isCanceled():
+                    return tracks
+                feedback.setProgress(
+                    65 + 15 * station_index / max(1, len(candidates_by_station))
+                )
+            active_track_indices = [
+                index for index in active_track_indices
+                if station_index - tracks[index][-1][0] <= gap_limit
+            ]
+            active = []
+            for track_index in active_track_indices:
+                track = tracks[track_index]
+                last_station, last_center = track[-1]
+                active.append((track_index, last_station, last_center, track))
+            active.sort(key=lambda item: item[2])
+            active_centers = np.asarray(
+                [item[2] for item in active], dtype=np.float64
+            )
+            pairs = []
+            for candidate_index, center in enumerate(candidates):
+                search_radius = spacing * 0.45 * 1.5
+                lo = np.searchsorted(active_centers, center - search_radius, side='left')
+                hi = np.searchsorted(active_centers, center + search_radius, side='right')
+                for track_index, last_station, last_center, track in active[lo:hi]:
+                    elapsed = station_index - last_station
+                    max_shift = min(
+                        max_deviation * elapsed * station_step, spacing * 0.45
+                    )
+                    predicted = last_center
+                    if len(track) >= 2:
+                        prior_station, prior_center = track[-2]
+                        steps = last_station - prior_station
+                        if steps > 0:
+                            velocity = (last_center - prior_center) / steps
+                            extrapolation = velocity * elapsed
+                            extrapolation = min(
+                                max(extrapolation, -max_shift * 0.5), max_shift * 0.5
+                            )
+                            predicted += extrapolation
+                    distance = abs(center - predicted)
+                    if distance <= max_shift:
+                        pairs.append((distance, track_index, candidate_index))
+            pairs.sort()
+            used_tracks = set()
+            used_candidates = set()
+            for _distance, track_index, candidate_index in pairs:
+                if track_index in used_tracks or candidate_index in used_candidates:
+                    continue
+                tracks[track_index].append(
+                    (station_index, float(candidates[candidate_index]))
+                )
+                used_tracks.add(track_index)
+                used_candidates.add(candidate_index)
+            active_track_indices = [
+                track_index for track_index, _last, _center, _track in active
+            ]
+            for candidate_index, center in enumerate(candidates):
+                if candidate_index not in used_candidates:
+                    tracks.append([(station_index, float(center))])
+                    active_track_indices.append(len(tracks) - 1)
+        return tracks
 
     def _smooth(self, values, window):
         if len(values) < window:
@@ -448,12 +608,14 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         return (
             'Usa a imagem como referência espacial e a nuvem de pontos da cultura '
             'para estimar a orientação e o espaçamento das linhas e desenhar cada '
-            'linha ajustada localmente aos pontos. As linhas podem ter pequenas '
-            'curvas independentes; o algoritmo não força todas a serem paralelas. '
-            'A saída é uma camada vetorial de linhas no CRS da imagem.\n\n'
+            'linha ajustada localmente aos pontos. A densidade é examinada em '
+            'estações sucessivas e os centros são rastreados ao longo do campo, '
+            'permitindo acompanhar curvas de nível sem forçar linhas retas e '
+            'paralelas. '
+            'A saída é uma camada vetorial de linhas no CRS métrico da nuvem.\n\n'
             'Ajuste o espaçamento esperado conforme o plantio. A posição de cada '
-            'trecho usa a mediana transversal dos pontos para reduzir o efeito de '
-            'pontos fora do centro, e a densidade mínima descarta trechos sustentados '
+            'trecho usa o centro ponderado da distribuição local para reduzir o '
+            'deslocamento causado por pontos fora da fileira, e a densidade mínima descarta trechos sustentados '
             'por poucos pontos. Os pontos precisam estar em CRS métrico; a imagem '
             'pode estar em outro CRS e é usada para conferir a área analisada.'
         )
