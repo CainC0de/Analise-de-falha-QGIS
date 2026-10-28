@@ -385,6 +385,9 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         width = min(len(profile), max(1, int(round(0.35 / bin_size))))
         kernel = np.ones(width, dtype=np.float64) / width
         smoothed = np.convolve(profile, kernel, mode='same')
+        local_support = np.convolve(
+            profile, np.ones(width, dtype=np.float64), mode='same'
+        )
         minimum_distance = max(1, int(round(spacing * 0.68 / bin_size)))
         local_maxima = (
             np.flatnonzero(
@@ -400,11 +403,14 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         if not local_maxima:
             return []
         peak_floor = max(
-            float(min_points),
+            0.25,
             float(smoothed.max()) * 0.05,
             float(np.median(smoothed)) * 1.15,
         )
-        candidates = [i for i in local_maxima if smoothed[i] >= peak_floor]
+        candidates = [
+            i for i in local_maxima
+            if smoothed[i] >= peak_floor and local_support[i] >= min_points
+        ]
         if not candidates:
             return []
 
