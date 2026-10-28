@@ -58,7 +58,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             self.MAX_DEVIATION,
             'Deslocamento lateral máximo por metro longitudinal (m/m)',
             type=QgsProcessingParameterNumber.Double,
-            defaultValue=0.65,
+            defaultValue=1.0,
             minValue=0.05,
             maxValue=1.5,
         ))
@@ -66,7 +66,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             self.MAX_GAP,
             'Maior lacuna longitudinal que pode ser interpolada (m)',
             type=QgsProcessingParameterNumber.Double,
-            defaultValue=3.0,
+            defaultValue=10.0,
             minValue=0.5,
             maxValue=20.0,
         ))
@@ -365,7 +365,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             # Cane rows repeat at the inter-row spacing. Penalizing strong
             # shorter repeats helps distinguish that spacing from repeated
             # plants along a row (a common source of 90-degree errors).
-            fundamental = periodicity - 0.45 * max(0.0, shorter_periodicity)
+            fundamental = periodicity - 0.90 * max(0.0, shorter_periodicity)
             score = peakiness * max(0.0, fundamental)
             if score > best_score:
                 best_score, best_angle = score, float(angle)
@@ -414,75 +414,21 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         if not candidates:
             return []
 
-        # Anchor a row-spacing lattice on each plausible peak. Choosing one
-        # strongest, regularly spaced sequence suppresses duplicate peaks from
-        # dense patches or weeds inside a single planted row.
-        tolerance = max(2, int(round(spacing * 0.15 / bin_size)))
-        spacing_bins = spacing / bin_size
-        candidate_array = np.asarray(sorted(candidates), dtype=np.int64)
-        peak_strength = smoothed[candidate_array]
-        count = len(candidate_array)
-        minimum_step = max(minimum_distance, spacing_bins - tolerance)
-        maximum_step = spacing_bins + tolerance
-        left_length = np.ones(count, dtype=np.int32)
-        left_strength = peak_strength.copy()
-        left_parent = np.full(count, -1, dtype=np.int64)
-        for index in range(count):
-            lo = np.searchsorted(
-                candidate_array, candidate_array[index] - maximum_step, side='left'
-            )
-            hi = np.searchsorted(
-                candidate_array, candidate_array[index] - minimum_step, side='right'
-            )
-            for previous in range(lo, hi):
-                length = left_length[previous] + 1
-                strength = left_strength[previous] + peak_strength[index]
-                if (length > left_length[index]
-                        or (length == left_length[index]
-                            and strength > left_strength[index])):
-                    left_length[index] = length
-                    left_strength[index] = strength
-                    left_parent[index] = previous
-
-        right_length = np.ones(count, dtype=np.int32)
-        right_strength = peak_strength.copy()
-        right_next = np.full(count, -1, dtype=np.int64)
-        for index in range(count - 1, -1, -1):
-            lo = np.searchsorted(
-                candidate_array, candidate_array[index] + minimum_step, side='left'
-            )
-            hi = np.searchsorted(
-                candidate_array, candidate_array[index] + maximum_step, side='right'
-            )
-            for following in range(lo, hi):
-                length = right_length[following] + 1
-                strength = right_strength[following] + peak_strength[index]
-                if (length > right_length[index]
-                        or (length == right_length[index]
-                            and strength > right_strength[index])):
-                    right_length[index] = length
-                    right_strength[index] = strength
-                    right_next[index] = following
-
-        anchor = max(
-            range(count),
-            key=lambda index: (
-                left_length[index] + right_length[index] - 1,
-                left_strength[index] + right_strength[index] - peak_strength[index],
-            ),
-        )
-        left_path = []
-        cursor = anchor
-        while cursor >= 0:
-            left_path.append(cursor)
-            cursor = int(left_parent[cursor])
-        left_path.reverse()
-        selected_indices = list(left_path)
-        cursor = int(right_next[anchor])
-        while cursor >= 0:
-            selected_indices.append(cursor)
-            cursor = int(right_next[cursor])
-        selected = candidate_array[selected_indices]
+        # Keep local supported ridges, then suppress nearby alternatives inside
+        # the same crop row. The row tracker links these peaks across stations;
+        # choosing one global lattice independently at every station can shift
+        # the row phase and fragment otherwise continuous field rows.
+        ranked = sorted(candidates, key=lambda index: smoothed[index], reverse=True)
+        suppressed = np.zeros(len(smoothed), dtype=bool)
+        selected = []
+        for peak in ranked:
+            if suppressed[peak]:
+                continue
+            selected.append(peak)
+            lo = max(0, peak - minimum_distance)
+            hi = min(len(suppressed), peak + minimum_distance + 1)
+            suppressed[lo:hi] = True
+        selected.sort()
         return [start + index * bin_size for index in selected]
 
     def _coordinate_batches(self, layer, extent):
