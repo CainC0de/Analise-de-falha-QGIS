@@ -318,7 +318,9 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             halo_px = max(16, int(math.ceil(4.5 / pixel_size_m)))
 
             nodata_values = [rgb.GetRasterBand(i).GetNoDataValue() for i in (1, 2, 3)]
-            min_pixels_per_cell = max(1, int(round((point_stride * point_stride) * 0.12)))
+            # >= ~1/3 of the cell must be crop: with the completed vegetation mask this keeps every
+            # cane cell while avoiding a halo of points outside the row centre
+            min_pixels_per_cell = max(1, int(round((point_stride * point_stride) * 0.34)))
 
             tile_rows = int(math.ceil(out_height / tile_step))
             tile_cols = int(math.ceil(out_width / tile_step))
@@ -475,6 +477,22 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         gli = (2.0 * g_f - r_f - b_f) / denom_gli
         ngrdi = (g_f - r_f) / (g_f + r_f + 1e-6)
 
+        is_pure_green = (
+            valid
+            & (gli > 0.08 + gli_threshold * 0.5)
+            & (ngrdi > 0.01 + gli_threshold * 0.5)
+            & (g_f > r_f)
+            & (g_f > b_f)
+        )
+        # soft green: shaded / dense / low-contrast cane that still is clearly vegetation
+        is_soft_green = (
+            valid
+            & (gli > 0.025 + gli_threshold * 0.5)
+            & (ngrdi > -0.035 + gli_threshold * 0.5)
+            & (g_f > b_f)
+            & (g_f >= 0.97 * r_f)
+        )
+
         h, w = gli.shape
         # Compute spatial background statistics on a ~15 cm sub-grid for high speed
         ds_factor = max(1, int(round(0.15 / max(0.01, pixel_size_m))))
@@ -490,12 +508,14 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             gli_sub = g_masked.reshape(sh, ds_factor, sw, ds_factor).mean(axis=(1, 3))
             ngrdi_sub = n_masked.reshape(sh, ds_factor, sw, ds_factor).mean(axis=(1, 3))
             sub_res = pixel_size_m * ds_factor
+            pg_sub = is_pure_green[:h_trim, :w_trim].reshape(sh, ds_factor, sw, ds_factor).mean(axis=(1, 3)).astype(np.float32)
         else:
             ds_factor = 1
             v_sub = valid.astype(np.float32)
             gli_sub = np.where(valid, gli, 0.0)
             ngrdi_sub = np.where(valid, ngrdi, 0.0)
             sub_res = pixel_size_m
+            pg_sub = is_pure_green.astype(np.float32)
 
         win_px = max(3, int(round(0.85 / max(0.01, sub_res))))
         if win_px % 2 == 0:
@@ -515,7 +535,10 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         broad_gli_sub = ndi.uniform_filter(gli_sub, size=broad_px) * broad_den
         broad_ngrdi_sub = ndi.uniform_filter(ngrdi_sub, size=broad_px) * broad_den
 
-        forest_core_sub = (broad_gli_sub > 0.085) & (broad_ngrdi_sub > -0.005)
+        # a forest/APP canopy is (almost) continuous green; cane rows always leave bare soil
+        # between rows, so dense healthy cane must NOT be mistaken for forest
+        pg_cover = ndi.uniform_filter(pg_sub * v_sub, size=broad_px) * broad_den
+        forest_core_sub = (broad_gli_sub > 0.085) & (broad_ngrdi_sub > -0.005) & (pg_cover > 0.60)
         buf_px = max(5, int(round(7.0 / max(0.01, sub_res))))
         forest_buf_sub = ndi.uniform_filter(forest_core_sub.astype(np.float32), size=buf_px) > 0.10
 
@@ -548,13 +571,6 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             & (g_f > b_f)
         )
 
-        is_pure_green = (
-            valid
-            & (gli > 0.08 + gli_threshold * 0.5)
-            & (ngrdi > 0.01 + gli_threshold * 0.5)
-            & (g_f > r_f)
-            & (g_f > b_f)
-        )
 
         veg_raster_mask = is_row_veg | is_pure_green
         if pixel_size_m < 0.06:
@@ -563,7 +579,15 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             )
             is_row_veg = is_row_veg & veg_raster_mask
 
-        crop_point_mask = is_row_veg & (~forest_buffer)
+        # points must cover ALL visible cane: contrast-detected rows, clearly green pixels and
+        # soft (shaded / dense) green that is part of a green blob
+        core_veg = is_row_veg | is_pure_green
+        near_px = max(3, int(round(0.30 / max(0.01, pixel_size_m))))
+        soft_ok = is_soft_green & (ndi.maximum_filter(core_veg, size=near_px | 1) > 0)
+        point_veg = core_veg | soft_ok
+        if pixel_size_m < 0.06:
+            point_veg = ndi.binary_opening(point_veg, structure=np.ones((2, 2), dtype=bool))
+        crop_point_mask = point_veg & (~forest_buffer)
         return veg_raster_mask, crop_point_mask, gli
 
     def _estimate_metric_pixel_size(self, raster, source_crs, utm_crs, width, height, context):

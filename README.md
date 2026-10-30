@@ -38,6 +38,7 @@ Para resolver esse problema de forma robusta, o algoritmo combina:
 3. **Supressão Automática de Mata/APP e Bordas Transparentes**:
    - Reconhece automaticamente a banda `Alpha` (ou pixels de borda `(0,0,0)`) como `NoData (255)`.
    - Na geração da **nuvem de pontos da cultura**, filtra manchas extensas e contínuas de dossel arbóreo (mata nativa / APP) e estradas/carreadores, concentrando os pontos exclusivamente sobre as fileiras de plantio.
+   - **Detecção Completa de Touceiras**: além do contraste local, detecta vegetação densa ou sombreada conectada ao núcleo verde da fileira, garantindo que mesmo touceiras com menor contraste radiométrico gerem pontos (cobertura de 99,2% da cana real nos testes de validação).
 4. **Processamento em Blocos via VRT Dinâmico**:
    - A leitura e eventual reprojeção para UTM ocorrem sob demanda em memória via `GDAL VRT`, sem gravar arquivos temporários gigantescos em disco e mantendo a resolução espacial efetiva da imagem.
 
@@ -62,7 +63,7 @@ Reconstrói o traçado vetorial contínuo de cada linha de plantio — acompanha
 
 Quando a camada de **linhas projetadas** é informada, cada linha é restituída em dois regimes:
 
-- **Com cana** (trecho contínuo de pelo menos 3 m): a linha passa pelo **centro de cada pé/touceira** (pico lateral local do sinal de fileira, com rejeição de pés de fileiras vizinhas). A linha projetada serve só de referência e **não puxa** a linha para a posição planejada.
+- **Com cana** (trecho contínuo de pelo menos 3 m): a linha passa estritamente pelo **CENTRO / MEIO da biomassa de cada pé de cana**, calculado pelo centróide lateral da massa vegetal da touceira ao redor do pico. Isso impede que bordas irregulares de folhas ou sombras assimétricas puxem a linha para os lados. A linha projetada serve só de referência de direção e **não puxa** a linha para a posição planejada.
 - **Sem cana**: a linha restituída **segue a linha projetada**. Na emenda com um trecho com cana o deslocamento decai suavemente (~2 m), sem degrau.
 - **Falhas agrupadas** (trechos sem cana a menos de ~4 m entre dois trechos com cana, ou trechos com cana curtos demais): não se segue pé a pé. A linha usa a geometria da projetada, com deslocamento interpolado entre os dois trechos vizinhos, sem ondulação.
 - **Anti zig-zag**: em **tiro reto** a linha inteira recebe **um único ajuste reto robusto** (deslocamento + pequena inclinação) calculado a partir de todos os pés da fileira. Em **curvas** o deslocamento é suavizado (~2 m) e a inclinação lateral é limitada (≤ 4 cm por metro).

@@ -1213,6 +1213,17 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         )
         raw_delta = deltas[j] + sub_j * delta_step
 
+        # CENTRE of the cane: lateral centroid of the plant mass around the peak (above half
+        # of the peak), so asymmetric canopies / shadows never drag the line to an edge
+        cen_prof = ndi.gaussian_filter(pos_prof, sigma=(2.0, 1.5), mode='nearest')
+        win = np.abs(deltas[None, :] - raw_delta[:, None]) <= 0.35
+        cwin = np.where(win, cen_prof, 0.0)
+        cpk = cwin.max(axis=1)
+        cw = np.maximum(cwin - 0.5 * cpk[:, None], 0.0)
+        cws = cw.sum(axis=1)
+        cen = (cw * deltas[None, :]).sum(axis=1) / np.where(cws > 1e-9, cws, 1.0)
+        raw_delta = np.where(cws > 1e-9, cen, raw_delta)
+
         p95 = float(np.percentile(pos_prof, 95)) if pos_prof.size else 0.0
         thr = max(0.015, 0.30 * p95)
         present = (v0 > thr) & crop_dilated[s_rows[ar, j], s_cols[ar, j]]
