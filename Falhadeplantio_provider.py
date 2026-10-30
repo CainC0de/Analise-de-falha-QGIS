@@ -33,4 +33,5 @@ class FalhaDePlantioProvider(QgsProcessingProvider):
         return QIcon(icon_path)
 
     def longName(self):
-        return self.tr('Falha de Plantio — Análise de cana-de-açúcar (v2.2)')
+        return self.tr('Falha de Plantio — Análise de cana-de-açúcar (v2.3)')
+

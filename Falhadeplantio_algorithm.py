@@ -1,4 +1,4 @@
-"""Initial RGB vegetation classification algorithm for the QGIS plugin."""
+"""RGB vegetation classification and crop point-cloud generation algorithm for QGIS."""
 
 import math
 import os
@@ -6,15 +6,9 @@ import tempfile
 
 import numpy as np
 from osgeo import gdal
+import scipy.ndimage as ndi
 from qgis.PyQt.QtCore import QVariant
 from qgis.core import (
-    QgsProcessing,
-    QgsProcessingAlgorithm,
-    QgsProcessingException,
-    QgsProcessingParameterFeatureSink,
-    QgsProcessingParameterNumber,
-    QgsProcessingParameterRasterDestination,
-    QgsProcessingParameterRasterLayer,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsFeature,
@@ -23,6 +17,13 @@ from qgis.core import (
     QgsFields,
     QgsGeometry,
     QgsPointXY,
+    QgsProcessing,
+    QgsProcessingAlgorithm,
+    QgsProcessingException,
+    QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterNumber,
+    QgsProcessingParameterRasterDestination,
+    QgsProcessingParameterRasterLayer,
     QgsUnitTypes,
     QgsWkbTypes,
 )
@@ -56,20 +57,20 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             self.PIXEL_SIZE_CM,
             'Tamanho do pixel de saída (cm)',
             type=QgsProcessingParameterNumber.Double,
-            defaultValue=3.0,
-            minValue=0.01,
+            defaultValue=5.0,
+            minValue=0.5,
         ))
         self.addParameter(QgsProcessingParameterNumber(
             self.POINT_SPACING_CM,
             'Espaçamento aproximado entre pontos da nuvem (cm)',
             type=QgsProcessingParameterNumber.Double,
-            defaultValue=10.0,
-            minValue=1.0,
-            maxValue=1000.0,
+            defaultValue=20.0,
+            minValue=5.0,
+            maxValue=200.0,
         ))
         self.addParameter(QgsProcessingParameterNumber(
             self.GLI_THRESHOLD,
-            'Limiar GLI para classificar como vegetação',
+            'Ajuste fino de sensibilidade GLI (0 = automático adaptativo)',
             type=QgsProcessingParameterNumber.Double,
             defaultValue=0.0,
             minValue=-1.0,
@@ -93,33 +94,13 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         crs = raster.crs()
         if not crs.isValid():
             raise QgsProcessingException('O raster não tem um CRS válido definido.')
-        pixel_cm = self.parameterAsDouble(parameters, self.PIXEL_SIZE_CM, context)
+
+        requested_pixel_cm = self.parameterAsDouble(
+            parameters, self.PIXEL_SIZE_CM, context
+        )
         point_spacing_cm = self.parameterAsDouble(
             parameters, self.POINT_SPACING_CM, context
         )
-
-        output_crs = crs
-        reproject_to_utm = (
-            crs.isGeographic() or crs.mapUnits() != QgsUnitTypes.DistanceMeters
-        )
-        if reproject_to_utm:
-            output_crs = self._local_utm_crs(raster, crs, context)
-            pixel_size_map_units = pixel_cm / 100.0
-            feedback.pushInfo(
-                f'Raster em unidades não métricas: reprojetando automaticamente para '
-                f'{output_crs.authid()} com pixel de {pixel_cm:g} cm.'
-            )
-        else:
-            metres_per_map_unit = QgsUnitTypes.fromUnitToUnitFactor(
-                crs.mapUnits(), QgsUnitTypes.DistanceMeters)
-            if not metres_per_map_unit or not np.isfinite(metres_per_map_unit):
-                raise QgsProcessingException(
-                    'Não foi possível converter as unidades do CRS para metros.'
-                )
-            pixel_size_map_units = (
-                pixel_cm / 100.0 / metres_per_map_unit
-            )
-
         threshold = self.parameterAsDouble(parameters, self.GLI_THRESHOLD, context)
         red_band = self.parameterAsInt(parameters, self.RED_BAND, context)
         green_band = self.parameterAsInt(parameters, self.GREEN_BAND, context)
@@ -140,6 +121,15 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             src = None
             raise QgsProcessingException('As bandas R, G e B devem ser diferentes.')
 
+        alpha_band = None
+        for b_idx in range(1, band_count + 1):
+            if b_idx in (red_band, green_band, blue_band):
+                continue
+            interp = src.GetRasterBand(b_idx).GetColorInterpretation()
+            if interp == gdal.GCI_AlphaBand or b_idx == 4:
+                alpha_band = b_idx
+                break
+
         width, height = src.RasterXSize, src.RasterYSize
         transform = src.GetGeoTransform()
         source_crs = src.GetProjection()
@@ -148,6 +138,44 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(
                 'O raster não tem sistema de referência espacial definido.'
             )
+
+        output_crs = crs
+        reproject_to_utm = (
+            crs.isGeographic() or crs.mapUnits() != QgsUnitTypes.DistanceMeters
+        )
+        if reproject_to_utm:
+            output_crs = self._local_utm_crs(raster, crs, context)
+            native_res_m = self._estimate_metric_pixel_size(
+                raster, crs, output_crs, width, height, context
+            )
+            pixel_cm = max(requested_pixel_cm, native_res_m * 100.0 * 0.95)
+            pixel_size_map_units = pixel_cm / 100.0
+            feedback.pushInfo(
+                f'Raster em unidades não métricas: reprojetando via VRT para '
+                f'{output_crs.authid()} com pixel de {pixel_cm:g} cm.'
+            )
+        else:
+            metres_per_map_unit = QgsUnitTypes.fromUnitToUnitFactor(
+                crs.mapUnits(), QgsUnitTypes.DistanceMeters
+            )
+            if not metres_per_map_unit or not np.isfinite(metres_per_map_unit):
+                src = None
+                raise QgsProcessingException(
+                    'Não foi possível converter as unidades do CRS para metros.'
+                )
+            native_px_w = math.hypot(transform[1], transform[4]) * metres_per_map_unit
+            native_px_h = math.hypot(transform[2], transform[5]) * metres_per_map_unit
+            native_res_m = min(native_px_w, native_px_h)
+            native_cm = native_res_m * 100.0
+            if requested_pixel_cm < native_cm * 0.95:
+                pixel_cm = native_cm
+                feedback.pushInfo(
+                    f'Mantendo a resolução nativa do raster ({pixel_cm:.2f} cm) '
+                    f'para evitar superamostragem artificial.'
+                )
+            else:
+                pixel_cm = requested_pixel_cm
+            pixel_size_map_units = pixel_cm / 100.0 / metres_per_map_unit
 
         corners = [
             (transform[0] + col * transform[1] + row * transform[2],
@@ -160,65 +188,65 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             max(point[0] for point in corners),
             max(point[1] for point in corners),
         )
-        src = None
-
-        feedback.pushInfo(f'Resolução solicitada: {pixel_cm:g} cm.')
-        feedback.pushInfo(
-            'O tamanho configurado define o espaçamento dos pixels no GeoTIFF; '
-            'não cria detalhe além da resolução espacial original da imagem.'
-        )
 
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='falha_plantio_rgb_') as temp_dir:
-            vrt_path = os.path.join(temp_dir, 'rgb.vrt')
-            rgb_path = os.path.join(temp_dir, 'rgb_resampled.tif')
+            band_list = [red_band, green_band, blue_band]
+            if alpha_band is not None:
+                band_list.append(alpha_band)
+
+            vrt_path = os.path.join(temp_dir, 'rgb_input.vrt')
             vrt = gdal.BuildVRT(
                 vrt_path,
                 raster.source(),
-                options=gdal.BuildVRTOptions(
-                    bandList=[red_band, green_band, blue_band]
-                ),
+                options=gdal.BuildVRTOptions(bandList=band_list),
             )
             if vrt is None:
+                src = None
                 raise QgsProcessingException('Não foi possível preparar as bandas RGB.')
             vrt = None
 
-            def warp_progress(_complete, _message, _data):
-                return 0 if feedback.isCanceled() else 1
+            need_warp = reproject_to_utm or (
+                abs(pixel_size_map_units - abs(transform[1])) > abs(transform[1]) * 0.05
+            ) or (transform[2] != 0.0 or transform[4] != 0.0)
 
-            warp_options = {
-                'format': 'GTiff',
-                'xRes': pixel_size_map_units,
-                'yRes': pixel_size_map_units,
-                'resampleAlg': 'bilinear',
-                'outputType': gdal.GDT_Float32,
-                'creationOptions': ['TILED=YES', 'COMPRESS=DEFLATE', 'BIGTIFF=IF_SAFER'],
-                'callback': warp_progress,
-            }
-            if reproject_to_utm:
-                warp_options['dstSRS'] = output_crs.toWkt()
+            if need_warp:
+                warped_vrt_path = os.path.join(temp_dir, 'rgb_warped.vrt')
+                warp_options = {
+                    'format': 'VRT',
+                    'xRes': pixel_size_map_units,
+                    'yRes': pixel_size_map_units,
+                    'resampleAlg': 'bilinear',
+                }
+                if reproject_to_utm:
+                    warp_options['dstSRS'] = output_crs.toWkt()
+                else:
+                    warp_options['outputBounds'] = bounds
+                warped = gdal.Warp(
+                    warped_vrt_path,
+                    vrt_path,
+                    options=gdal.WarpOptions(**warp_options),
+                )
+                if warped is None:
+                    src = None
+                    raise QgsProcessingException('Falha ao configurar grade de leitura RGB.')
+                warped = None
+                rgb = gdal.Open(warped_vrt_path, gdal.GA_ReadOnly)
             else:
-                warp_options['outputBounds'] = bounds
-            warped = gdal.Warp(
-                rgb_path,
-                vrt_path,
-                options=gdal.WarpOptions(**warp_options),
-            )
-            if warped is None:
-                if feedback.isCanceled():
-                    return {}
-                raise QgsProcessingException('Falha ao reamostrar as bandas RGB.')
-            warped = None
-            if feedback.isCanceled():
-                return {}
+                rgb = gdal.Open(vrt_path, gdal.GA_ReadOnly)
 
-            rgb = gdal.Open(rgb_path, gdal.GA_ReadOnly)
+            src = None
+            if rgb is None:
+                raise QgsProcessingException('Falha ao abrir grade RGB para leitura.')
+
             out_width = rgb.RasterXSize
             out_height = rgb.RasterYSize
+            has_alpha = rgb.RasterCount >= 4
             feedback.pushInfo(
-                f'Grade de saída: {out_width} × {out_height} pixels em '
-                f'{output_crs.authid()}.'
+                f'Grade de processamento: {out_width} × {out_height} pixels '
+                f'({pixel_cm:.2f} cm/px) em {output_crs.authid()}.'
             )
+
             driver = gdal.GetDriverByName('GTiff')
             result = driver.Create(
                 output_path, out_width, out_height, 1, gdal.GDT_Byte,
@@ -231,9 +259,9 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             result.SetProjection(rgb.GetProjection())
             result.SetMetadataItem('CLASS_0', 'Sem vegetação verde detectada')
             result.SetMetadataItem('CLASS_1', 'Vegetação verde detectada')
-            result.SetMetadataItem('INDEX', 'GLI=(2*G-R-B)/(2*G+R+B)')
+            result.SetMetadataItem('INDEX', 'Adaptive GLI + NGRDI')
             result.SetMetadataItem('GLI_THRESHOLD', str(threshold))
-            result.SetMetadataItem('PIXEL_SIZE_CM', str(pixel_cm))
+            result.SetMetadataItem('PIXEL_SIZE_CM', f'{pixel_cm:.2f}')
 
             result_band = result.GetRasterBand(1)
             result_band.SetNoDataValue(255)
@@ -264,163 +292,287 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             geotransform = rgb.GetGeoTransform()
             pixel_width = math.hypot(geotransform[1], geotransform[4])
             pixel_height = math.hypot(geotransform[2], geotransform[5])
-            if pixel_width <= 0 or pixel_height <= 0:
+            pixel_size_m = min(pixel_width, pixel_height)
+            if pixel_size_m <= 0:
                 result = None
                 rgb = None
-                raise QgsProcessingException('O raster reamostrado tem pixels inválidos.')
+                raise QgsProcessingException('O raster tem dimensão de pixel inválida.')
+
+            # Keep point spacing accurate (never coarsen beyond 30 cm so row spacing ~1.5 m is well resolved)
             requested_spacing_m = point_spacing_cm / 100.0
-            pixel_size_m = min(pixel_width, pixel_height)
-            point_stride = max(1, int(math.ceil(requested_spacing_m / pixel_size_m)))
-            grid_rows = int(math.ceil(out_height / point_stride))
-            grid_columns = int(math.ceil(out_width / point_stride))
-            max_grid_cells = 2000000
-            while grid_rows * grid_columns > max_grid_cells:
-                scale_up = math.sqrt(grid_rows * grid_columns / max_grid_cells)
-                point_stride = max(
-                    point_stride + 1,
-                    int(math.ceil(point_stride * scale_up)),
-                )
-                grid_rows = int(math.ceil(out_height / point_stride))
-                grid_columns = int(math.ceil(out_width / point_stride))
+            field_area_m2 = (out_width * pixel_width) * (out_height * pixel_height)
+            if field_area_m2 > 500000.0 and requested_spacing_m < 0.20:
+                effective_req_m = 0.20
+            else:
+                effective_req_m = requested_spacing_m
+            point_stride = max(1, int(round(effective_req_m / pixel_size_m)))
             effective_spacing_cm = point_stride * pixel_size_m * 100.0
             feedback.pushInfo(
-                f'Nuvem representativa: espaçamento aproximado '
-                f'{effective_spacing_cm:.1f} cm; classificação mantém resolução '
-                f'{pixel_cm:g} cm.'
+                f'Nuvem de pontos da cultura: espaçamento de {effective_spacing_cm:.1f} cm '
+                f'(agregado por bloco com filtragem de palhada, sombra e mata).'
             )
 
-            # Keep one compact accumulator per output point cell. The dense
-            # pixel classification stays full resolution; only the auxiliary
-            # vector point cloud is spatially sampled for processing speed.
-            cell_total = grid_rows * grid_columns
-            point_counts = np.zeros(cell_total, dtype=np.uint32)
-            point_row_sums = np.zeros(cell_total, dtype=np.float64)
-            point_column_sums = np.zeros(cell_total, dtype=np.float64)
-            point_gli_sums = np.zeros(cell_total, dtype=np.float64)
+            # Align tile size to a multiple of point_stride so every cell is self-contained inside a tile
+            cells_per_tile = max(16, int(round(2048 / point_stride)))
+            tile_step = cells_per_tile * point_stride
+            halo_px = max(16, int(math.ceil(4.5 / pixel_size_m)))
 
-            block_rows = 256
-            block_columns = 1024
             nodata_values = [rgb.GetRasterBand(i).GetNoDataValue() for i in (1, 2, 3)]
-            tile_count = (
-                int(math.ceil(out_height / block_rows))
-                * int(math.ceil(out_width / block_columns))
-            )
-            tile_index = 0
-            for row in range(0, out_height, block_rows):
+            min_pixels_per_cell = max(1, int(round((point_stride * point_stride) * 0.12)))
+
+            tile_rows = int(math.ceil(out_height / tile_step))
+            tile_cols = int(math.ceil(out_width / tile_step))
+            total_tiles = max(1, tile_rows * tile_cols)
+            tile_idx = 0
+            point_count = 0
+            point_batch = []
+
+            for row0 in range(0, out_height, tile_step):
                 if feedback.isCanceled():
                     result = None
                     rgb = None
-                    try:
-                        os.remove(output_path)
-                    except OSError:
-                        pass
                     return {}
-                rows = min(block_rows, out_height - row)
-                for column in range(0, out_width, block_columns):
+                row1 = min(out_height, row0 + tile_step)
+                r_pad0 = max(0, row0 - halo_px)
+                r_pad1 = min(out_height, row1 + halo_px)
+                win_h = r_pad1 - r_pad0
+                inner_r0 = row0 - r_pad0
+                inner_r1 = inner_r0 + (row1 - row0)
+
+                for col0 in range(0, out_width, tile_step):
                     if feedback.isCanceled():
                         result = None
                         rgb = None
-                        try:
-                            os.remove(output_path)
-                        except OSError:
-                            pass
                         return {}
-                    columns = min(block_columns, out_width - column)
-                    red = rgb.GetRasterBand(1).ReadAsArray(column, row, columns, rows)
-                    green = rgb.GetRasterBand(2).ReadAsArray(column, row, columns, rows)
-                    blue = rgb.GetRasterBand(3).ReadAsArray(column, row, columns, rows)
-                    denominator = 2.0 * green + red + blue
-                    gli = np.zeros(denominator.shape, dtype=np.float32)
-                    np.divide(2.0 * green - red - blue, denominator,
-                              out=gli, where=denominator != 0)
-                    vegetation = np.zeros(denominator.shape, dtype=np.uint8)
-                    vegetation[gli > threshold] = 1
+                    col1 = min(out_width, col0 + tile_step)
+                    c_pad0 = max(0, col0 - halo_px)
+                    c_pad1 = min(out_width, col1 + halo_px)
+                    win_w = c_pad1 - c_pad0
+                    inner_c0 = col0 - c_pad0
+                    inner_c1 = inner_c0 + (col1 - col0)
+
+                    red = rgb.GetRasterBand(1).ReadAsArray(c_pad0, r_pad0, win_w, win_h)
+                    green = rgb.GetRasterBand(2).ReadAsArray(c_pad0, r_pad0, win_w, win_h)
+                    blue = rgb.GetRasterBand(3).ReadAsArray(c_pad0, r_pad0, win_w, win_h)
+
                     valid = np.isfinite(red) & np.isfinite(green) & np.isfinite(blue)
                     for data, nodata in zip((red, green, blue), nodata_values):
                         if nodata is not None:
                             valid &= data != nodata
-                    vegetation[~valid] = 255
-                    result_band.WriteArray(vegetation, column, row)
+                    if has_alpha:
+                        alpha = rgb.GetRasterBand(4).ReadAsArray(c_pad0, r_pad0, win_w, win_h)
+                        valid &= alpha > 0
+                    valid &= (red > 0) | (green > 0) | (blue > 0)
 
-                    local_rows, local_columns = np.nonzero(vegetation == 1)
+                    inner_valid = valid[inner_r0:inner_r1, inner_c0:inner_c1]
+                    if not np.any(inner_valid):
+                        empty_tile = np.full(
+                            (row1 - row0, col1 - col0), 255, dtype=np.uint8
+                        )
+                        result_band.WriteArray(empty_tile, col0, row0)
+                        tile_idx += 1
+                        feedback.setProgress(95.0 * tile_idx / total_tiles)
+                        continue
+
+                    veg_mask, crop_mask, gli = self._classify_window(
+                        red, green, blue, valid, pixel_size_m, threshold
+                    )
+
+                    inner_veg = veg_mask[inner_r0:inner_r1, inner_c0:inner_c1]
+                    inner_crop = crop_mask[inner_r0:inner_r1, inner_c0:inner_c1]
+                    inner_gli = gli[inner_r0:inner_r1, inner_c0:inner_c1]
+
+                    out_tile = np.zeros((row1 - row0, col1 - col0), dtype=np.uint8)
+                    out_tile[inner_veg] = 1
+                    out_tile[~inner_valid] = 255
+                    result_band.WriteArray(out_tile, col0, row0)
+
+                    local_rows, local_cols = np.nonzero(inner_crop)
                     if local_rows.size:
-                        global_rows = row + local_rows
-                        global_columns = column + local_columns
+                        n_cell_cols = int(math.ceil((col1 - col0) / point_stride))
                         cell_ids = (
-                            (global_rows // point_stride) * grid_columns
-                            + global_columns // point_stride
+                            (local_rows // point_stride) * n_cell_cols
+                            + (local_cols // point_stride)
                         )
                         unique_ids, inverse = np.unique(cell_ids, return_inverse=True)
-                        counts = np.bincount(inverse).astype(np.uint32)
-                        point_counts[unique_ids] += counts
-                        point_row_sums[unique_ids] += np.bincount(
-                            inverse, weights=global_rows
-                        )
-                        point_column_sums[unique_ids] += np.bincount(
-                            inverse, weights=global_columns
-                        )
-                        point_gli_sums[unique_ids] += np.bincount(
-                            inverse, weights=gli[local_rows, local_columns]
-                        )
-                    tile_index += 1
-                    feedback.setProgress(80.0 * tile_index / max(1, tile_count))
+                        counts = np.bincount(inverse).astype(np.int32)
+                        keep_cells = counts >= min_pixels_per_cell
+                        if np.any(keep_cells):
+                            global_rows = (row0 + local_rows).astype(np.float64)
+                            global_cols = (col0 + local_cols).astype(np.float64)
+                            row_sums = np.bincount(inverse, weights=global_rows)[keep_cells]
+                            col_sums = np.bincount(inverse, weights=global_cols)[keep_cells]
+                            gli_sums = np.bincount(
+                                inverse, weights=inner_gli[local_rows, local_cols]
+                            )[keep_cells]
+                            kept_counts = counts[keep_cells]
 
-            occupied_cells = np.flatnonzero(point_counts)
-            point_batch = []
-            point_count = 0
-            for cell_id in occupied_cells:
-                if point_count % 5000 == 0 and feedback.isCanceled():
-                    result = None
-                    rgb = None
-                    try:
-                        os.remove(output_path)
-                    except OSError:
-                        pass
-                    return {}
-                count = int(point_counts[cell_id])
-                pixel_row = point_row_sums[cell_id] / count
-                pixel_column = point_column_sums[cell_id] / count
-                x = (geotransform[0] + (pixel_column + 0.5) * geotransform[1]
-                     + (pixel_row + 0.5) * geotransform[2])
-                y = (geotransform[3] + (pixel_column + 0.5) * geotransform[4]
-                     + (pixel_row + 0.5) * geotransform[5])
-                feature = QgsFeature(point_fields)
-                feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(x, y)))
-                feature.setAttributes([
-                    float(point_gli_sums[cell_id] / count), 1, count
-                ])
-                point_batch.append(feature)
-                point_count += 1
-                if len(point_batch) >= 5000:
-                    if not point_sink.addFeatures(
-                            point_batch, QgsFeatureSink.FastInsert):
-                        raise QgsProcessingException(
-                            'Erro ao gravar pontos da cultura no GeoPackage.'
-                        )
-                    point_batch = []
-                if point_count % 5000 == 0:
-                    feedback.setProgress(
-                        80.0 + 20.0 * point_count / max(1, len(occupied_cells))
-                    )
+                            mean_rows = row_sums / kept_counts
+                            mean_cols = col_sums / kept_counts
+                            mean_glis = gli_sums / kept_counts
+                            xs = (
+                                geotransform[0]
+                                + (mean_cols + 0.5) * geotransform[1]
+                                + (mean_rows + 0.5) * geotransform[2]
+                            )
+                            ys = (
+                                geotransform[3]
+                                + (mean_cols + 0.5) * geotransform[4]
+                                + (mean_rows + 0.5) * geotransform[5]
+                            )
+
+                            for x_pt, y_pt, gli_pt, cnt_pt in zip(
+                                    xs, ys, mean_glis, kept_counts):
+                                feat = QgsFeature(point_fields)
+                                feat.setGeometry(
+                                    QgsGeometry.fromPointXY(
+                                        QgsPointXY(float(x_pt), float(y_pt))
+                                    )
+                                )
+                                feat.setAttributes([float(gli_pt), 1, int(cnt_pt)])
+                                point_batch.append(feat)
+                                point_count += 1
+                                if len(point_batch) >= 10000:
+                                    if not point_sink.addFeatures(
+                                            point_batch, QgsFeatureSink.FastInsert):
+                                        raise QgsProcessingException(
+                                            'Erro ao gravar pontos da cultura no GeoPackage.'
+                                        )
+                                    point_batch = []
+
+                    tile_idx += 1
+                    feedback.setProgress(95.0 * tile_idx / total_tiles)
+
             if point_batch and not point_sink.addFeatures(
                     point_batch, QgsFeatureSink.FastInsert):
                 raise QgsProcessingException(
                     'Erro ao gravar os últimos pontos da cultura no GeoPackage.'
                 )
-            feedback.setProgress(100.0)
             point_sink = None
-
             result_band.FlushCache()
             result.FlushCache()
             result = None
             rgb = None
+            feedback.setProgress(100.0)
 
         feedback.pushInfo(
-            'Classificação concluída: 1 = vegetação verde; 0 = sem vegetação verde; '
+            'Classificação concluída: 1 = vegetação verde; 0 = palhada/solo; '
             '255 = NoData.'
         )
-        feedback.pushInfo(f'Pontos de vegetação gravados: {point_count}.')
+        feedback.pushInfo(f'Pontos representativos da cultura gravados: {point_count}.')
         return {self.OUTPUT: output_path, self.OUTPUT_POINTS: point_destination}
+
+    def _classify_window(self, red, green, blue, valid, pixel_size_m, gli_threshold):
+        """
+        Classify green vegetation and extract crop-row pixels while rejecting yellow straw
+        (palhada), bare soil tracks (carreadores), cloud shadow shifts, and dense forest (mata).
+        """
+        r_f = red.astype(np.float32)
+        g_f = green.astype(np.float32)
+        b_f = blue.astype(np.float32)
+
+        denom_gli = 2.0 * g_f + r_f + b_f + 1e-6
+        gli = (2.0 * g_f - r_f - b_f) / denom_gli
+        ngrdi = (g_f - r_f) / (g_f + r_f + 1e-6)
+
+        h, w = gli.shape
+        # Compute spatial background statistics on a ~15 cm sub-grid for high speed
+        ds_factor = max(1, int(round(0.15 / max(0.01, pixel_size_m))))
+        if ds_factor > 1 and h >= ds_factor * 8 and w >= ds_factor * 8:
+            sh = h // ds_factor
+            sw = w // ds_factor
+            h_trim = sh * ds_factor
+            w_trim = sw * ds_factor
+
+            v_sub = valid[:h_trim, :w_trim].reshape(sh, ds_factor, sw, ds_factor).mean(axis=(1, 3)).astype(np.float32)
+            g_masked = np.where(valid[:h_trim, :w_trim], gli[:h_trim, :w_trim], 0.0)
+            n_masked = np.where(valid[:h_trim, :w_trim], ngrdi[:h_trim, :w_trim], 0.0)
+            gli_sub = g_masked.reshape(sh, ds_factor, sw, ds_factor).mean(axis=(1, 3))
+            ngrdi_sub = n_masked.reshape(sh, ds_factor, sw, ds_factor).mean(axis=(1, 3))
+            sub_res = pixel_size_m * ds_factor
+        else:
+            ds_factor = 1
+            v_sub = valid.astype(np.float32)
+            gli_sub = np.where(valid, gli, 0.0)
+            ngrdi_sub = np.where(valid, ngrdi, 0.0)
+            sub_res = pixel_size_m
+
+        win_px = max(3, int(round(0.85 / max(0.01, sub_res))))
+        if win_px % 2 == 0:
+            win_px += 1
+        inv_den = 1.0 / (ndi.uniform_filter(v_sub, size=win_px) + 1e-6)
+        gli_bg_sub = ndi.uniform_filter(gli_sub, size=win_px) * inv_den
+        ngrdi_bg_sub = ndi.uniform_filter(ngrdi_sub, size=win_px) * inv_den
+
+        v_norm = np.maximum(v_sub, 1e-6)
+        d_gli_sub = (gli_sub / v_norm) - gli_bg_sub
+        d_ngrdi_sub = (ngrdi_sub / v_norm) - ngrdi_bg_sub
+        lc_sub = 0.55 * d_gli_sub + 0.45 * d_ngrdi_sub
+
+        broad_px = max(9, int(round(4.5 / max(0.01, sub_res))))
+        broad_den = 1.0 / (ndi.uniform_filter(v_sub, size=broad_px) + 1e-6)
+        mad_sub = ndi.uniform_filter(np.abs(lc_sub) * v_sub, size=broad_px) * broad_den
+        broad_gli_sub = ndi.uniform_filter(gli_sub, size=broad_px) * broad_den
+        broad_ngrdi_sub = ndi.uniform_filter(ngrdi_sub, size=broad_px) * broad_den
+
+        forest_core_sub = (broad_gli_sub > 0.085) & (broad_ngrdi_sub > -0.005)
+        buf_px = max(5, int(round(7.0 / max(0.01, sub_res))))
+        forest_buf_sub = ndi.uniform_filter(forest_core_sub.astype(np.float32), size=buf_px) > 0.10
+
+        if ds_factor > 1:
+            zoom_y = h / gli_bg_sub.shape[0]
+            zoom_x = w / gli_bg_sub.shape[1]
+            gli_bg = ndi.zoom(gli_bg_sub, (zoom_y, zoom_x), order=1)[:h, :w]
+            ngrdi_bg = ndi.zoom(ngrdi_bg_sub, (zoom_y, zoom_x), order=1)[:h, :w]
+            local_mad = ndi.zoom(mad_sub, (zoom_y, zoom_x), order=1)[:h, :w]
+            forest_buffer = ndi.zoom(forest_buf_sub.astype(np.float32), (zoom_y, zoom_x), order=0)[:h, :w] > 0.5
+        else:
+            gli_bg = gli_bg_sub
+            ngrdi_bg = ngrdi_bg_sub
+            local_mad = mad_sub
+            forest_buffer = forest_buf_sub
+
+        d_gli = gli - gli_bg
+        d_ngrdi = ngrdi - ngrdi_bg
+        local_contrast = 0.55 * d_gli + 0.45 * d_ngrdi
+
+        rel_thresh = np.maximum(0.0045, 0.55 * local_mad) + gli_threshold * 0.20
+
+        is_row_veg = (
+            valid
+            & (local_contrast > rel_thresh)
+            & (d_gli > 0.003)
+            & (d_ngrdi > 0.002)
+            & (gli > 0.005 + gli_threshold * 0.5)
+            & (ngrdi > -0.085 + gli_threshold * 0.5)
+            & (g_f > b_f)
+        )
+
+        is_pure_green = (
+            valid
+            & (gli > 0.08 + gli_threshold * 0.5)
+            & (ngrdi > 0.01 + gli_threshold * 0.5)
+            & (g_f > r_f)
+            & (g_f > b_f)
+        )
+
+        veg_raster_mask = is_row_veg | is_pure_green
+        if pixel_size_m < 0.06:
+            veg_raster_mask = ndi.binary_opening(
+                veg_raster_mask, structure=np.ones((2, 2), dtype=bool)
+            )
+            is_row_veg = is_row_veg & veg_raster_mask
+
+        crop_point_mask = is_row_veg & (~forest_buffer)
+        return veg_raster_mask, crop_point_mask, gli
+
+    def _estimate_metric_pixel_size(self, raster, source_crs, utm_crs, width, height, context):
+        try:
+            tr = QgsCoordinateTransform(source_crs, utm_crs, context.transformContext())
+            ext_m = tr.transformBoundingBox(raster.extent())
+            return min(ext_m.width() / max(1, width), ext_m.height() / max(1, height))
+        except Exception:
+            return 0.05
 
     def name(self):
         return 'classificar_vegetacao_rgb'
@@ -439,22 +591,19 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
 
     def shortHelpString(self):
         return (
-            'Classifica cada pixel de uma imagem RGB como vegetação verde (1) ou '
-            'sem vegetação verde (0), usando o índice GLI: '
-            '(2G − R − B) / (2G + R + B). Pixels NoData recebem o valor 255.\n\n'
-            'Escolha as bandas R, G e B conforme a ordem do seu raster, informe o '
-            'limiar GLI e o tamanho de pixel de saída em centímetros. O algoritmo '
-            'grava a classificação em GeoTIFF e cria uma camada de pontos GeoPackage '
-            'com pontos representativos agregados em células espaciais. O raster mantém '
-            'todos os pixels classificados; ajuste o espaçamento dos pontos para equilibrar '
-            'detalhe e velocidade. O raster precisa '
-            'usar um CRS definido. Se estiver em graus ou unidades não métricas, '
-            'a saída será reprojetada automaticamente para a zona UTM local.\n\n'
-            'A resolução de saída define o espaçamento dos pixels e não aumenta o '
-            'detalhe real da imagem. Esta etapa detecta cobertura verde em RGB; '
-            'ela não distingue cana de plantas daninhas sem linhas de plantio, '
-            'bandas adicionais ou treinamento/classificação específica. A saída de '
-            'pontos é 2D porque uma imagem RGB não contém elevação.'
+            'Classifica a cobertura vegetal de cana-de-açúcar em imagens RGB '
+            'combinando os índices GLI = (2G − R − B)/(2G + R + B) e '
+            'NGRDI = (G − R)/(G + R) com filtragem espacial adaptativa local '
+            '(resistente à palhada seca, solo exposto e sombras de nuvens).\n\n'
+            'Gera:\n'
+            '1. Um GeoTIFF classificado (1 = vegetação verde, 0 = palhada/solo, '
+            '255 = NoData/borda transparente).\n'
+            '2. Uma nuvem de pontos GeoPackage centrada nas touceiras/fileiras '
+            'da cultura (filtrando automaticamente manchas densas de mata/APP e '
+            'carreadores).\n\n'
+            'O processamento usa leitura direta em blocos via VRT (sem duplicar '
+            'dezenas de GB em arquivos temporários) e preserva a resolução '
+            'espacial efetiva da imagem.'
         )
 
     def helpUrl(self):
