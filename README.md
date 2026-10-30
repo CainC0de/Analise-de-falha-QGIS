@@ -62,17 +62,14 @@ Reconstrói o traçado vetorial contínuo de cada linha de plantio — acompanha
 
 Quando a camada de **linhas projetadas** é informada, cada linha é restituída em dois regimes:
 
-- **Com cana**: a linha passa pelo **centro de cada pé/touceira** (pico lateral local do sinal de fileira, com rejeição de pés de fileiras vizinhas). A linha projetada serve apenas de referência de direção e **não puxa** a linha para a posição planejada. Em tiro reto o ajuste é uma reta robusta pelos centros (sem zig-zag); em curvas a linha acompanha os centros com suavização curta (~1,5 m).
+- **Com cana** (trecho contínuo de pelo menos 3 m): a linha passa pelo **centro de cada pé/touceira** (pico lateral local do sinal de fileira, com rejeição de pés de fileiras vizinhas). A linha projetada serve só de referência e **não puxa** a linha para a posição planejada.
 - **Sem cana**: a linha restituída **segue a linha projetada**. Na emenda com um trecho com cana o deslocamento decai suavemente (~2 m), sem degrau.
+- **Falhas agrupadas** (trechos sem cana a menos de ~4 m entre dois trechos com cana, ou trechos com cana curtos demais): não se segue pé a pé. A linha usa a geometria da projetada, com deslocamento interpolado entre os dois trechos vizinhos, sem ondulação.
+- **Anti zig-zag**: em **tiro reto** a linha inteira recebe **um único ajuste reto robusto** (deslocamento + pequena inclinação) calculado a partir de todos os pés da fileira. Em **curvas** o deslocamento é suavizado (~2 m) e a inclinação lateral é limitada (≤ 4 cm por metro).
 
-#### Parâmetros adicionais das linhas projetadas
+Parâmetros: *afastamento lateral máximo para seguir os pés* (padrão `0,70 m`) e *comprimento mínimo de trecho com cana* (padrão `3,0 m`). A saída ganha o campo `pct_pes` (% do comprimento da linha reconstruído pelos centros dos pés).
 
-- **Afastamento lateral máximo para seguir os pés**: padrão 0,70 m.
-- **Comprimento mínimo de trecho com cana para centralizar nos pés**: padrão 1,5 m.
-- **pct_pes**: percentual do comprimento da linha reconstruído pelos centros dos pés.
-
-Validação (talhão 2, 132 linhas, ortomosaico real; centro das fileiras medido de forma independente por ExG a 6 cm): desvio mediano ao centro da cultura **2,9 cm** (P95 8,0 cm) contra 9,8 cm (P95 21,1 cm) das linhas projetadas; rugosidade lateral mediana 3,3 cm; processamento ~12 s.
-
+Validação (talhão 2, 132 linhas, ortomosaico real; centro das fileiras medido de forma independente por ExG a 6 cm): desvio mediano ao centro da cultura **2,9 cm** (P95 8,8 cm) contra 9,8 cm (P95 21,1 cm) das linhas projetadas; rugosidade lateral (zig-zag) mediana 2,2 cm, P95 4,2 cm e máxima 4,7 cm (linhas projetadas: 1,4 / 3,8 / 4,0 cm); processamento ~11 s.
 ### Metodologia de Restituição e Análise de Falhas (v2.3)
 
 Em vez de assumir um único ângulo global reto para toda a propriedade, o algoritmo executa um pipeline espacial 2D em quatro etapas:

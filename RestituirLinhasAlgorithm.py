@@ -103,7 +103,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             self.MIN_CROP_RUN,
             'Linhas projetadas: comprimento mínimo de trecho com cana para centralizar nos pés (m)',
             type=QgsProcessingParameterNumber.Double,
-            defaultValue=1.5,
+            defaultValue=3.0,
             minValue=0.5,
             maxValue=10.0,
         ))
@@ -1025,7 +1025,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             self, planned_layer, planned_transform, image_extent,
             density, raster_density, green_contrast, valid_field_mask,
             grid_res, spacing, xmin, ymax, gw, gh, feedback,
-            max_offset=0.70, min_run=1.5, decay_len=2.0):
+            max_offset=0.70, min_run=3.0, decay_len=2.0):
         raw_parts = self._extract_planned_polylines(
             planned_layer, planned_transform, image_extent, feedback
         )
@@ -1234,8 +1234,10 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         pd = raw_delta[pres_idx]
 
         # continuous runs of cane (links shorter than 1 m are the same stand)
-        cuts = np.flatnonzero(np.diff(ps) > 1.0)
+        cuts = np.flatnonzero(np.diff(ps) > 0.75)
         runs = []
+        kept_s = []
+        kept_d = []
         for seg in np.split(np.arange(len(ps)), cuts + 1):
             if len(seg) < 5 or float(ps[seg[-1]] - ps[seg[0]]) < min_run:
                 continue
@@ -1270,6 +1272,8 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                 good = den > 1e-3
                 vals = np.interp(grid_s, grid_s[good], num[good] / den[good])
             runs.append((ia, ib, np.asarray(vals, dtype=np.float64)))
+            kept_s.append(rs)
+            kept_d.append(rd)
 
         if not runs:
             return zero, no_plant
@@ -1287,6 +1291,38 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             fade += vals[-1] * np.clip(1.0 - after / decay_len, 0.0, 1.0) * (after > 0)
             fade += vals[0] * np.clip(1.0 - before / decay_len, 0.0, 1.0) * (before > 0)
         offset = np.where(from_plant, offset, fade)
+        # clustered failures: short cane-free stretches between stands are bridged
+        # linearly (planned-line shape, no dip/zig-zag between two nearby stands)
+        for (ia0, ib0, v0_), (ia1, ib1, v1_) in zip(runs[:-1], runs[1:]):
+            if ib1 - ib0 > 1 and ia1 - ib0 > 1 and (sub_s[ia1] - sub_s[ib0]) <= 4.0:
+                offset[ib0 + 1:ia1] = np.linspace(v0_[-1], v1_[0], ia1 - ib0 - 1 + 2)[1:-1]
+
+        # straight rows: ONE robust straight offset over the whole row (never zig-zag)
+        straight_done = False
+        if is_straight and kept_s:
+            ks = np.concatenate(kept_s)
+            kd = np.concatenate(kept_d)
+            if len(ks) >= 8 and float(ks.max() - ks.min()) >= 3.0:
+                c0 = float(ks.min())
+                coef = np.polyfit(ks - c0, kd, 1)
+                for _ in range(5):
+                    res = kd - np.polyval(coef, ks - c0)
+                    w = 1.0 / (1.0 + (res / 0.04) ** 2)
+                    coef = np.polyfit(ks - c0, kd, 1, w=w)
+                res = kd - np.polyval(coef, ks - c0)
+                if float(np.median(np.abs(res))) <= 0.07:
+                    slope = max(-0.02, min(0.02, float(coef[0])))
+                    icpt = float(np.average(kd - slope * (ks - c0), weights=w))
+                    offset = icpt + slope * (sub_s - c0)
+                    straight_done = True
+        if not straight_done:
+            # curves / contours: smooth, then forbid abrupt lateral slopes
+            offset = ndi.gaussian_filter1d(offset, 2.0 / step_s, mode='nearest')
+            lim = 0.04 * step_s
+            for i in range(1, m_len):
+                offset[i] = min(max(offset[i], offset[i - 1] - lim), offset[i - 1] + lim)
+            for i in range(m_len - 2, -1, -1):
+                offset[i] = min(max(offset[i], offset[i + 1] - lim), offset[i + 1] + lim)
         return offset, from_plant
 
 
