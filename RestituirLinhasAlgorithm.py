@@ -8,6 +8,8 @@ import numpy as np
 from osgeo import gdal
 import scipy.ndimage as ndi
 from scipy.signal import fftconvolve
+from scipy.spatial import cKDTree
+from .cane_centers import detect_stool_centers, fit_center_offsets
 from qgis.PyQt.QtCore import QVariant
 from qgis.core import (
     QgsCoordinateTransform,
@@ -240,13 +242,13 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                 planned_layer, planned_transform, image_extent,
                 density, raster_density, green_contrast, valid_field_mask,
                 grid_res, spacing, xmin, ymax, gw, gh, feedback,
-                max_offset=planned_max_offset, min_run=min_crop_run
+                max_offset=planned_max_offset, min_run=min_crop_run,
+                raster_source=raster.source(), dst_wkt=crs.toWkt()
             )
             del raster_density, green_contrast, valid_field_mask
             if feedback.isCanceled():
                 return {}
         else:
-            del raster_density, green_contrast, valid_field_mask
             feedback.setProgress(25.0)
             feedback.pushInfo(
                 'Estimando campo de orientação local 2D (suporte a curvas de nível, '
@@ -281,6 +283,19 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             if feedback.isCanceled():
                 return {}
 
+            if polylines:
+                detected_parts = [[(pt.x(), pt.y()) for pt in item[0]] for item in polylines]
+                polylines, gap_segments = self._reconstruct_from_planned_lines(
+                    None, None, image_extent, density, raster_density, green_contrast,
+                    valid_field_mask, grid_res, spacing, xmin, ymax, gw, gh, feedback,
+                    max_offset=min(planned_max_offset, 0.30 * spacing),
+                    min_run=min_crop_run, raster_source=raster.source(), dst_wkt=crs.toWkt(),
+                    raw_parts_override=detected_parts
+                )
+            del raster_density, green_contrast, valid_field_mask
+
+        if feedback.isCanceled():
+            return {}
         if len(polylines) < 1 or (len(polylines) < 2 and not has_planned):
             raise QgsProcessingException(
                 'Não foram identificadas fileiras contínuas suficientes. '
@@ -1025,8 +1040,9 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             self, planned_layer, planned_transform, image_extent,
             density, raster_density, green_contrast, valid_field_mask,
             grid_res, spacing, xmin, ymax, gw, gh, feedback,
-            max_offset=0.70, min_run=3.0, decay_len=2.0):
-        raw_parts = self._extract_planned_polylines(
+            max_offset=0.70, min_run=3.0, decay_len=2.0,
+            raster_source=None, dst_wkt=None, raw_parts_override=None):
+        raw_parts = raw_parts_override if raw_parts_override is not None else self._extract_planned_polylines(
             planned_layer, planned_transform, image_extent, feedback
         )
         if not raw_parts:
@@ -1057,7 +1073,8 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
 
         step_s = 0.25
         delta_step = 0.04
-        max_shift = max(0.2, float(max_offset))
+        # Stay inside this row's half spacing; never search the adjacent row centre.
+        max_shift = min(0.45 * spacing, max(0.2, float(max_offset)))
         deltas = np.arange(-max_shift, max_shift + 0.001, delta_step, dtype=np.float64)
         n_deltas = len(deltas)
         tie_prior = 1.0 - 0.08 * (deltas / max(max_shift, 1e-6)) ** 2
@@ -1065,16 +1082,43 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         polylines = []
         gap_segments = []
         total_parts = len(raw_parts)
+        sampled = [self._resample_and_smooth_planned_line(part, step_m=step_s)
+                   for part in raw_parts]
+        valid_parts = [i for i, item in enumerate(sampled) if item[0] is not None]
+        centers_by_part = {}
+        if raster_source and valid_parts:
+            reference_xy = np.concatenate([sampled[i][1] for i in valid_parts])
+            owners = np.concatenate([np.full(len(sampled[i][1]), i) for i in valid_parts])
+            reference_tree = cKDTree(reference_xy)
+            feedback.pushInfo('Detectando núcleos vegetais e convergência de folhas em blocos RGB...')
+            try:
+                cx, cy, confidence = detect_stool_centers(
+                    raster_source, dst_wkt, xmin, ymax - gh * grid_res,
+                    xmin + gw * grid_res, ymax, feedback=feedback,
+                    keep_fn=lambda x, y: reference_tree.query(np.column_stack([x, y]))[0] <= max_shift,
+                    progress_start=feedback.progress(), progress_span=(95.0 - feedback.progress()) * 0.4
+                )
+                if cx.size:
+                    center_xy = np.column_stack([cx, cy])
+                    distance, nearest = reference_tree.query(center_xy)
+                    assigned = owners[nearest]
+                    for owner in np.unique(assigned):
+                        take = (assigned == owner) & (distance <= max_shift)
+                        centers_by_part[int(owner)] = (center_xy[take], confidence[take])
+                feedback.pushInfo(f'Núcleos candidatos associados a uma única fileira: {cx.size}.')
+            except (RuntimeError, ValueError) as exc:
+                feedback.reportError(f'Refinamento RGB indisponível; usando suporte da nuvem: {exc}')
+            if feedback.isCanceled():
+                return [], []
 
+        trace_start = feedback.progress()
         for p_idx, part in enumerate(raw_parts):
             if p_idx % 20 == 0:
                 if feedback.isCanceled():
                     return polylines, gap_segments
-                feedback.setProgress(35.0 + 60.0 * p_idx / max(1, total_parts))
+                feedback.setProgress(trace_start + (95.0 - trace_start) * p_idx / max(1, total_parts))
 
-            s_grid, p_xy, n_xy, is_straight_full = self._resample_and_smooth_planned_line(
-                part, step_m=step_s
-            )
+            s_grid, p_xy, n_xy, is_straight_full = sampled[p_idx]
             if s_grid is None:
                 continue
 
@@ -1123,14 +1167,28 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                     np.floor((ymax - sample_y) / grid_res).astype(np.int32), 0, gh - 1
                 )
 
-                # bilinear sampling of the analysis grid. NOTE: grid coordinates are used
-                # WITHOUT the usual -0.5 cell-centre shift: this was calibrated against the
-                # raster (ExG) row centres and removes a systematic half-cell (grid_res/2) offset.
-                col_f = (sample_x - xmin) / grid_res
-                row_f = (ymax - sample_y) / grid_res
+                # Array indices identify pixel centres, not pixel corners.
+                col_f = (sample_x - xmin) / grid_res - 0.5
+                row_f = (ymax - sample_y) / grid_res - 0.5
+                center_delta = np.zeros(m_len)
+                center_weight = np.zeros(m_len)
+                if p_idx in centers_by_part:
+                    xy, cf = centers_by_part[p_idx]
+                    distance, nearest = cKDTree(sub_p).query(xy)
+                    delta = np.sum((xy - sub_p[nearest]) * sub_n[nearest], axis=1)
+                    tangent = np.gradient(sub_p, axis=0)
+                    tangent /= np.maximum(np.linalg.norm(tangent, axis=1)[:, None], 1e-9)
+                    along = np.sum((xy - sub_p[nearest]) * tangent[nearest], axis=1)
+                    inside = (distance <= max_shift) & (np.abs(along) <= 0.5 * step_s)
+                    sums = np.zeros(m_len)
+                    np.add.at(sums, nearest[inside], delta[inside] * cf[inside])
+                    np.add.at(center_weight, nearest[inside], cf[inside])
+                    center_delta = sums / np.maximum(center_weight, 1e-9)
+                    center_weight = np.clip(center_weight, 0.0, 1.0)
                 smooth_delta, from_plant = self._offsets_from_plant_centers(
                     row_signal, crop_dilated, s_rows, s_cols, row_f, col_f, deltas, delta_step,
-                    tie_prior, sub_s, spacing, is_straight, min_run, decay_len
+                    tie_prior, sub_s, spacing, is_straight, min_run, decay_len,
+                    center_delta, center_weight
                 )
 
 
@@ -1177,165 +1235,87 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
 
     def _offsets_from_plant_centers(
             self, row_signal, crop_dilated, s_rows, s_cols, row_f, col_f, deltas, delta_step,
-            tie_prior, sub_s, spacing, is_straight, min_run, decay_len):
-        """Lateral offset (relative to the planned line) for every sample.
-
-        WITH cane: the offset follows the centre of the planted tufts (per-plant
-        peak of the local row signal, outliers rejected, no long smoothing).
-        WITHOUT cane: the offset decays to zero, i.e. the planned line is used.
-        Returns (offset array, bool mask 'rebuilt from plant centres').
-        """
+            tie_prior, sub_s, spacing, is_straight, min_run, decay_len,
+            center_delta=None, center_weight=None):
+        """Estimate centres, reject competing rows, then fit bounded continuous offsets."""
         m_len, n_deltas = s_rows.shape
-        step_s = float(np.median(np.diff(sub_s))) if m_len > 1 else 0.25
         zero = np.zeros(m_len, dtype=np.float64)
-        no_plant = np.zeros(m_len, dtype=bool)
-
+        missing = np.zeros(m_len, dtype=bool)
+        if m_len < 3:
+            return zero, missing
         pos_prof = np.maximum(0.0, ndi.map_coordinates(
-            row_signal, [row_f, col_f], order=1, mode='nearest'
-        ))
-        fine_prof = ndi.gaussian_filter(pos_prof, sigma=(1.0, 1.5), mode='nearest')
-        regional = ndi.gaussian_filter(pos_prof, sigma=(48.0, 1.5), mode='nearest')
-        anchor_delta = deltas[np.argmax(regional * tie_prior[None, :], axis=1)]
-
-        corridor = np.abs(deltas[None, :] - anchor_delta[:, None]) <= 0.32 * spacing
-        masked = np.where(corridor, fine_prof * tie_prior[None, :], -1.0)
-        j = np.argmax(masked, axis=1)
+            row_signal, [row_f, col_f], order=1, mode='constant', cval=0.0))
+        fine = ndi.gaussian_filter(pos_prof, sigma=(1.0, 1.0), mode='nearest')
+        step_s = float(np.median(np.diff(sub_s)))
+        regional = ndi.gaussian_filter(pos_prof, sigma=(6.0 / step_s, 1.0), mode='nearest')
+        anchor = deltas[np.argmax(regional * tie_prior[None, :], axis=1)]
+        corridor = np.abs(deltas[None, :] - anchor[:, None]) <= 0.28 * spacing
+        j = np.argmax(np.where(corridor, fine * tie_prior[None, :], -1.0), axis=1)
         ar = np.arange(m_len)
-        v0 = fine_prof[ar, j]
-        jm = np.clip(j - 1, 0, n_deltas - 1)
-        jp = np.clip(j + 1, 0, n_deltas - 1)
-        vm = fine_prof[ar, jm]
-        vp = fine_prof[ar, jp]
-        denom = 2.0 * (vm + vp - 2.0 * v0)
-        interior = (j > 0) & (j < n_deltas - 1) & (np.abs(denom) > 1e-6)
-        sub_j = np.where(
-            interior, np.clip((vm - vp) / np.where(interior, denom, 1.0), -0.5, 0.5), 0.0
-        )
-        raw_delta = deltas[j] + sub_j * delta_step
-
-        # CENTRE of the cane: lateral centroid of the plant mass around the peak (above half
-        # of the peak), so asymmetric canopies / shadows never drag the line to an edge
-        cen_prof = ndi.gaussian_filter(pos_prof, sigma=(2.0, 1.5), mode='nearest')
-        win = np.abs(deltas[None, :] - raw_delta[:, None]) <= 0.35
-        cwin = np.where(win, cen_prof, 0.0)
-        cpk = cwin.max(axis=1)
-        cw = np.maximum(cwin - 0.5 * cpk[:, None], 0.0)
-        cws = cw.sum(axis=1)
-        cen = (cw * deltas[None, :]).sum(axis=1) / np.where(cws > 1e-9, cws, 1.0)
-        raw_delta = np.where(cws > 1e-9, cen, raw_delta)
-
-        p95 = float(np.percentile(pos_prof, 95)) if pos_prof.size else 0.0
-        thr = max(0.015, 0.30 * p95)
-        present = (v0 > thr) & crop_dilated[s_rows[ar, j], s_cols[ar, j]]
-        pres_idx = np.flatnonzero(present)
-        if pres_idx.size < 5:
-            return zero, no_plant
-
-        # reject tufts that belong to a neighbouring row / noise (robust running median)
-        ps = sub_s[pres_idx]
-        pd = raw_delta[pres_idx]
+        v0 = fine[ar, j]
+        jm, jp = np.maximum(j - 1, 0), np.minimum(j + 1, n_deltas - 1)
+        denom = 2.0 * (fine[ar, jm] + fine[ar, jp] - 2.0 * v0)
+        interior = (j > 0) & (j < n_deltas - 1) & (np.abs(denom) > 1e-9)
+        sub_j = np.where(interior, np.clip(
+            (fine[ar, jm] - fine[ar, jp]) / np.where(interior, denom, 1.0), -0.5, 0.5), 0.0)
+        observed = deltas[j] + sub_j * delta_step
+        threshold = max(0.015, 0.30 * float(np.percentile(pos_prof, 95)))
+        present = (v0 > threshold) & crop_dilated[s_rows[ar, j], s_cols[ar, j]]
+        confidence = np.where(present, 0.30, 0.0)
+        precise = np.zeros(m_len, dtype=bool)
+        if center_delta is not None:
+            # High resolution candidates must agree with the row corridor.
+            precise = (center_weight >= 0.10) & (np.abs(center_delta - anchor) <= 0.25 * spacing)
+            observed = np.where(precise, center_delta, observed)
+            confidence = np.where(precise, np.maximum(0.6, center_weight), confidence)
+            present |= precise
+        idx = np.flatnonzero(present)
+        if idx.size < 5:
+            return zero, missing
+        ps, pd = sub_s[idx], observed[idx]
         lo = np.searchsorted(ps, ps - 3.0)
         hi = np.searchsorted(ps, ps + 3.0, side='right')
-        med = np.array([np.median(pd[lo[i]:hi[i]]) for i in range(len(pd))])
-        inlier = np.abs(pd - med) <= max(0.10, 0.10 * spacing)
-        pres_idx = pres_idx[inlier]
-        if pres_idx.size < 5:
-            return zero, no_plant
-        ps = sub_s[pres_idx]
-        pd = raw_delta[pres_idx]
-
-        # continuous runs of cane (links shorter than 1 m are the same stand)
-        cuts = np.flatnonzero(np.diff(ps) > 0.75)
-        runs = []
-        kept_s = []
-        kept_d = []
-        for seg in np.split(np.arange(len(ps)), cuts + 1):
-            if len(seg) < 5 or float(ps[seg[-1]] - ps[seg[0]]) < min_run:
-                continue
-            rs, rd = ps[seg], pd[seg]
-            ia = int(np.searchsorted(sub_s, rs[0] - 1e-9))
-            ib = int(np.searchsorted(sub_s, rs[-1] + 1e-9, side='right')) - 1
-            if ib <= ia:
-                continue
-            grid_s = sub_s[ia:ib + 1]
-            vals = None
-            if is_straight and (rs[-1] - rs[0]) >= 3.0:
-                w = np.ones(len(rs))
-                coef = np.polyfit(rs - rs[0], rd, 1)
-                for _ in range(4):
-                    res = rd - np.polyval(coef, rs - rs[0])
-                    w = 1.0 / (1.0 + (res / 0.04) ** 2)
-                    coef = np.polyfit(rs - rs[0], rd, 1, w=w)
-                res = rd - np.polyval(coef, rs - rs[0])
-                if float(np.median(np.abs(res))) <= 0.07:
-                    slope = max(-0.03, min(0.03, float(coef[0])))
-                    icpt = float(np.average(rd - slope * (rs - rs[0]), weights=w))
-                    vals = icpt + slope * (grid_s - rs[0])
-            if vals is None:
-                acc = np.zeros(len(grid_s))
-                wgt = np.zeros(len(grid_s))
-                pos = np.clip(np.searchsorted(grid_s, rs), 0, len(grid_s) - 1)
-                np.add.at(acc, pos, rd)
-                np.add.at(wgt, pos, 1.0)
-                sg = max(1.0, 1.5 / step_s)
-                num = ndi.gaussian_filter1d(acc, sg, mode='nearest')
-                den = ndi.gaussian_filter1d(wgt, sg, mode='nearest')
-                good = den > 1e-3
-                vals = np.interp(grid_s, grid_s[good], num[good] / den[good])
-            runs.append((ia, ib, np.asarray(vals, dtype=np.float64)))
-            kept_s.append(rs)
-            kept_d.append(rd)
-
-        if not runs:
-            return zero, no_plant
-
-        offset = zero.copy()
-        from_plant = no_plant.copy()
-        for ia, ib, vals in runs:
-            offset[ia:ib + 1] = vals
-            from_plant[ia:ib + 1] = True
-        # no cane: offset fades out to the planned line (no step at the seam)
-        fade = np.zeros(m_len, dtype=np.float64)
-        for ia, ib, vals in runs:
-            after = sub_s - sub_s[ib]
-            before = sub_s[ia] - sub_s
-            fade += vals[-1] * np.clip(1.0 - after / decay_len, 0.0, 1.0) * (after > 0)
-            fade += vals[0] * np.clip(1.0 - before / decay_len, 0.0, 1.0) * (before > 0)
-        offset = np.where(from_plant, offset, fade)
-        # clustered failures: short cane-free stretches between stands are bridged
-        # linearly (planned-line shape, no dip/zig-zag between two nearby stands)
-        for (ia0, ib0, v0_), (ia1, ib1, v1_) in zip(runs[:-1], runs[1:]):
-            if ib1 - ib0 > 1 and ia1 - ib0 > 1 and (sub_s[ia1] - sub_s[ib0]) <= 4.0:
-                offset[ib0 + 1:ia1] = np.linspace(v0_[-1], v1_[0], ia1 - ib0 - 1 + 2)[1:-1]
-
-        # straight rows: ONE robust straight offset over the whole row (never zig-zag)
-        straight_done = False
-        if is_straight and kept_s:
-            ks = np.concatenate(kept_s)
-            kd = np.concatenate(kept_d)
-            if len(ks) >= 8 and float(ks.max() - ks.min()) >= 3.0:
-                c0 = float(ks.min())
-                coef = np.polyfit(ks - c0, kd, 1)
-                for _ in range(5):
-                    res = kd - np.polyval(coef, ks - c0)
-                    w = 1.0 / (1.0 + (res / 0.04) ** 2)
-                    coef = np.polyfit(ks - c0, kd, 1, w=w)
-                res = kd - np.polyval(coef, ks - c0)
-                if float(np.median(np.abs(res))) <= 0.07:
-                    slope = max(-0.02, min(0.02, float(coef[0])))
-                    icpt = float(np.average(kd - slope * (ks - c0), weights=w))
-                    offset = icpt + slope * (sub_s - c0)
-                    straight_done = True
-        if not straight_done:
-            # curves / contours: smooth, then forbid abrupt lateral slopes
-            offset = ndi.gaussian_filter1d(offset, 2.0 / step_s, mode='nearest')
-            lim = 0.04 * step_s
-            for i in range(1, m_len):
-                offset[i] = min(max(offset[i], offset[i - 1] - lim), offset[i - 1] + lim)
-            for i in range(m_len - 2, -1, -1):
-                offset[i] = min(max(offset[i], offset[i + 1] - lim), offset[i + 1] + lim)
-        return offset, from_plant
-
+        median = np.array([np.median(pd[a:b]) for a, b in zip(lo, hi)])
+        accepted = np.abs(pd - median) <= max(0.12, 0.12 * spacing)
+        present[idx[~accepted]] = False
+        # Coarse support must persist; an isolated RGB core can refine an established row.
+        idx = np.flatnonzero(present)
+        cuts = np.flatnonzero(np.diff(sub_s[idx]) > 0.75) + 1
+        support = np.zeros(m_len, dtype=bool)
+        for group in np.split(idx, cuts):
+            if group.size and (sub_s[group[-1]] - sub_s[group[0]] >= min_run
+                               or np.any(precise[group])):
+                support[group] = True
+        confidence[~support] = 0.0
+        idx = np.flatnonzero(support)
+        if idx.size < 5:
+            return zero, missing
+        baseline = zero.copy()
+        flex_limit = min(abs(float(deltas[0])), abs(float(deltas[-1])))
+        slope_limit = 0.04
+        if is_straight:
+            x = sub_s[idx] - sub_s[idx[0]]
+            y = observed[idx]
+            weights = confidence[idx].copy()
+            coef = np.polyfit(x, y, 1, w=np.sqrt(weights))
+            for _ in range(5):
+                residual = y - np.polyval(coef, x)
+                robust = weights * np.minimum(1.0, 0.06 / np.maximum(np.abs(residual), 1e-9))
+                coef = np.polyfit(x, y, 1, w=np.sqrt(robust))
+            slope = float(np.clip(coef[0], -0.02, 0.02))
+            intercept = float(np.average(y - slope * x, weights=robust))
+            baseline = intercept + slope * (sub_s - sub_s[idx[0]])
+            # Keep the baseline inside the row corridor over the entire line.
+            bound = max(abs(float(deltas[0])), abs(float(deltas[-1]))) - 0.08
+            scale = max(1.0, float(np.max(np.abs(baseline))) / max(bound, 0.01))
+            baseline /= scale
+            flex_limit = min(0.08, flex_limit)
+            slope_limit = max(0.005, 0.03 - abs(slope / scale))
+        fitted = fit_center_offsets(
+            sub_s, observed, confidence, baseline, max_flex=flex_limit,
+            max_slope=slope_limit, max_curvature=0.02)
+        # No binary mask is applied here: that would introduce corners at gaps.
+        return fitted, support
 
     def _extract_planned_polylines(
             self, planned_layer, planned_transform, image_extent, feedback):
@@ -1445,20 +1425,23 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             'Restitui as linhas de plantio de cana-de-açúcar (retas em tiro reto, em '
             'curva de nível, com terraço embutido ou em múltiplos talhões) e calcula '
             'as falhas de plantio ao longo de cada fileira.\n\n'
+            'Para refinar os centros das touceiras, selecione o ortomosaico RGB original. '
+            'Com um raster classificado de banda única, o ajuste usa a nuvem e a grade de cultura.\n\n'
             'Como funciona:\n'
             '1. Combina a nuvem de pontos da cultura com o contraste local da '
             'imagem de referência em uma grade métrica de alta resolução.\n'
             '2. Quando a camada opcional de "Linhas projetadas" é informada:\n'
             '   - Restitui as fileiras até mesmo em áreas 100% sem cana (falhas totais), '
             'usando o projeto de plantio recortado à área útil do talhão;\n'
-            '   - Centraliza automaticamente linhas de cana deslocadas para o eixo exato '
-            'da cultura por regressão longitudinal Nadaraya-Watson sem entortar a linha;\n'
-            '   - Garante alinhamento matemático perfeito (zero zig-zag) em tiros retos '
-            'e curvatura suave em curvas de nível.\n'
+            '   - Estima centros visíveis das touceiras pelo núcleo morfológico e '
+            'convergência de folhas no RGB;\n'
+            '   - Ajusta uma reta robusta com pequenas flexões contínuas, limitadas '
+            'a 8 cm e 3 cm/m em tiros retos, preservando curvas de nível. '
+            'A base oculta dos colmos não pode ser garantida pelo RGB.\n'
             '3. Quando "Linhas projetadas" não é informada:\n'
             '   - Estima o campo 2D de orientação local via FFT em janelas e aplica '
             'filtragem direcional adaptativa (comb filter) com retificação automática '
-            'de tiros retos e suavização Gaussiana em curvas.\n'
+            'de tiros retos, seguida do mesmo refinamento de centros com flexão limitada.\n'
             '4. Mede automaticamente todos os trechos de falha (>= 0,5 m sem cultura) '
             'ao longo de cada linha restituída, gravando os atributos compr_m, '
             'falha_m, falha_pct e num_falhas, além da camada vetorial de falhas.'

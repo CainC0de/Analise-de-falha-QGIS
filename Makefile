@@ -4,7 +4,9 @@ SOURCES = \
 	__init__.py \
 	Falhadeplantio.py \
 	Falhadeplantio_algorithm.py \
-	Falhadeplantio_provider.py
+	Falhadeplantio_provider.py \
+	RestituirLinhasAlgorithm.py \
+	cane_centers.py
 
 PLUGINNAME = Falhadeplantio
 
@@ -12,7 +14,9 @@ PY_FILES = \
 	__init__.py \
 	Falhadeplantio.py \
 	Falhadeplantio_algorithm.py \
-	Falhadeplantio_provider.py
+	Falhadeplantio_provider.py \
+	RestituirLinhasAlgorithm.py \
+	cane_centers.py
 
 UI_FILES =
 

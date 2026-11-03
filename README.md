@@ -61,16 +61,21 @@ Reconstrói o traçado vetorial contínuo de cada linha de plantio — acompanha
 
 ### Linhas projetadas (opcional): regra de uso
 
-Quando a camada de **linhas projetadas** é informada, cada linha é restituída em dois regimes:
+O refinamento usa as linhas projetadas, quando disponíveis, ou as fileiras detectadas automaticamente como referência:
 
-- **Com cana** (trecho contínuo de pelo menos 3 m): a linha passa estritamente pelo **CENTRO / MEIO da biomassa de cada pé de cana**, calculado pelo centróide lateral da massa vegetal da touceira ao redor do pico. Isso impede que bordas irregulares de folhas ou sombras assimétricas puxem a linha para os lados. A linha projetada serve só de referência de direção e **não puxa** a linha para a posição planejada.
-- **Sem cana**: a linha restituída **segue a linha projetada**. Na emenda com um trecho com cana o deslocamento decai suavemente (~2 m), sem degrau.
-- **Falhas agrupadas** (trechos sem cana a menos de ~4 m entre dois trechos com cana, ou trechos com cana curtos demais): não se segue pé a pé. A linha usa a geometria da projetada, com deslocamento interpolado entre os dois trechos vizinhos, sem ondulação.
-- **Anti zig-zag**: em **tiro reto** a linha inteira recebe **um único ajuste reto robusto** (deslocamento + pequena inclinação) calculado a partir de todos os pés da fileira. Em **curvas** o deslocamento é suavizado (~2 m) e a inclinação lateral é limitada (≤ 4 cm por metro).
+- **Centro estimado da touceira:** o RGB original é analisado em blocos com halo, sem criar resolução artificial. Abertura morfológica e transformada de distância priorizam o núcleo compacto; convergência de folhas fornece evidência complementar. Cada candidato pertence a uma única fileira de referência.
+- **Pequenos desvios suaves:** a reta robusta recebe uma correção contínua de até 8 cm, com inclinação total de até 3 cm/m e curvatura adicional de até 0,02 m⁻¹. O ajuste ponderado penaliza curvatura e reduz o peso de observações discrepantes. Candidatos que exigem ultrapassar esses limites não são seguidos exatamente.
+- **Curvas de nível:** a geometria de referência é preservada; a correção lateral tem inclinação máxima de 4 cm/m e curvatura adicional de até 0,02 m⁻¹.
+- **Falhas:** observações ausentes recebem peso zero e o ajuste permanece contínuo. O traçado interpolado não é considerado prova de presença de cana; as falhas continuam sendo medidas pela cobertura vegetal.
+- **Sem linhas projetadas:** as linhas detectadas automaticamente passam pelo mesmo refinamento de centros.
+- **Raster sem RGB:** o algoritmo informa no log que usará a nuvem e a grade de cultura, com menor capacidade de localizar touceiras individuais.
 
-Parâmetros: *afastamento lateral máximo para seguir os pés* (padrão `0,70 m`) e *comprimento mínimo de trecho com cana* (padrão `3,0 m`). A saída ganha o campo `pct_pes` (% do comprimento da linha reconstruído pelos centros dos pés).
+Os parâmetros de afastamento lateral e comprimento mínimo de suporte contínuo permanecem disponíveis. Núcleos RGB com evidência suficiente podem refinar trechos mais curtos. O campo **pct_pes** indica o percentual de segmentos com suporte aceito nas duas extremidades.
 
-Validação (talhão 2, 132 linhas, ortomosaico real; centro das fileiras medido de forma independente por ExG a 6 cm): desvio mediano ao centro da cultura **2,9 cm** (P95 8,8 cm) contra 9,8 cm (P95 21,1 cm) das linhas projetadas; rugosidade lateral (zig-zag) mediana 2,2 cm, P95 4,2 cm e máxima 4,7 cm (linhas projetadas: 1,4 / 3,8 / 4,0 cm); processamento ~11 s.
+**Limites da interpretação:** o centro do núcleo visível é uma estimativa, não uma medição da base dos colmos. Folhas sobrepostas, plantas daninhas, sombras e resolução insuficiente podem ocultar a base. Os limites geométricos reduzem ondulações, mas não garantem acerto de todos os pés.
+
+**Validação desta revisão:** testes numéricos e imagens sintéticas verificam deslocamentos pequenos, observações discrepantes, lacunas, limites geométricos, coordenadas no centro do pixel e folhas assimétricas. As métricas de talhão registradas em revisões anteriores não validam este novo método. A validação com centros anotados no ortomosaico real ainda é necessária.
+
 ### Metodologia de Restituição e Análise de Falhas (v2.3)
 
 Em vez de assumir um único ângulo global reto para toda a propriedade, o algoritmo executa um pipeline espacial 2D em quatro etapas:
@@ -118,3 +123,11 @@ Em vez de assumir um único ângulo global reto para toda a propriedade, o algor
 
 1. Copie esta pasta para o diretório de plugins do QGIS (`%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins`) ou instale via arquivo ZIP em **Plugins → Gerenciar e Instalar Plugins → Instalar a partir de ZIP**.
 2. Requer **QGIS 3.22 ou superior** com as bibliotecas padrão distribuídas no ambiente Python do QGIS (`GDAL`, `NumPy` e `SciPy`).
+
+### Bases do refinamento de centros
+
+- Eilers (2003), *A perfect smoother*: ajuste por mínimos quadrados penalizados. [Artigo](https://pubmed.ncbi.nlm.nih.gov/14570219/)
+- *Mapping skips in sugarcane fields using object-based analysis of UAV images*: identificação separada das fileiras, vegetação e falhas. [Artigo](https://www.sciencedirect.com/science/article/pii/S0168169917312243)
+- *Pixel-wise navigation line extraction of cross-growth-stage seedlings in complex sugarcane fields*: detecção de vegetação e ajuste de linhas de navegação. [Artigo](https://pmc.ncbi.nlm.nih.gov/articles/PMC11823478/)
+
+O uso conjunto de núcleo morfológico, votos de folhas e limites de flexão é uma implementação deste projeto, e ainda precisa ser validado com dados reais.
