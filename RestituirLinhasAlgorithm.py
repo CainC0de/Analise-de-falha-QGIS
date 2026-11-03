@@ -9,7 +9,7 @@ from osgeo import gdal
 import scipy.ndimage as ndi
 from scipy.signal import fftconvolve
 from scipy.spatial import cKDTree
-from .cane_centers import detect_stool_centers, fit_center_offsets
+from .cane_centers import detect_stool_centers, fit_center_offsets, row_context_support
 from qgis.PyQt.QtCore import QVariant
 from qgis.core import (
     QgsCoordinateTransform,
@@ -310,6 +310,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         fields.append(QgsField('falha_pct', QVariant.Double, len=10, prec=2))
         fields.append(QgsField('num_falhas', QVariant.Int))
         fields.append(QgsField('pct_pes', QVariant.Double, len=10, prec=2))
+        fields.append(QgsField('pct_proj', QVariant.Double, len=10, prec=2))
 
         sink, destination = self.parameterAsSink(
             parameters, self.OUTPUT, context, fields,
@@ -333,6 +334,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         for idx, item in enumerate(polylines):
             pts_xy, angle_deg, length_m, gap_m, gap_pct, n_gaps = item[:6]
             pct_pes = float(item[6]) if len(item) > 6 else 100.0
+            pct_proj = float(item[7]) if len(item) > 7 else 0.0
             total_length_m += length_m
             total_gap_m += gap_m
             feat = QgsFeature(fields)
@@ -345,6 +347,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                 round(float(gap_pct), 2),
                 int(n_gaps),
                 round(pct_pes, 2),
+                round(pct_proj, 2),
             ])
             line_batch.append(feat)
             if len(line_batch) >= 2000:
@@ -1082,7 +1085,8 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         polylines = []
         gap_segments = []
         total_parts = len(raw_parts)
-        sampled = [self._resample_and_smooth_planned_line(part, step_m=step_s)
+        sampled = [self._resample_and_smooth_planned_line(
+                       part, step_m=step_s, preserve_geometry=raw_parts_override is None)
                    for part in raw_parts]
         valid_parts = [i for i, item in enumerate(sampled) if item[0] is not None]
         centers_by_part = {}
@@ -1185,10 +1189,10 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                     np.add.at(center_weight, nearest[inside], cf[inside])
                     center_delta = sums / np.maximum(center_weight, 1e-9)
                     center_weight = np.clip(center_weight, 0.0, 1.0)
-                smooth_delta, from_plant = self._offsets_from_plant_centers(
+                smooth_delta, from_plant, protected = self._offsets_from_plant_centers(
                     row_signal, crop_dilated, s_rows, s_cols, row_f, col_f, deltas, delta_step,
                     tie_prior, sub_s, spacing, is_straight, min_run, decay_len,
-                    center_delta, center_weight
+                    center_delta, center_weight, return_context=True
                 )
 
 
@@ -1227,22 +1231,35 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                 ]
                 fp_seg = from_plant[:-1] & from_plant[1:]
                 pct_pe = 100.0 * float(seg_lens[fp_seg].sum()) / max(0.01, length_m)
+                locked_seg = protected[:-1] & protected[1:]
+                pct_projected = 100.0 * float(seg_lens[locked_seg].sum()) / max(0.01, length_m)
                 polylines.append(
-                    (pts_xy, angle_deg, length_m, gap_m_total, gap_pct, n_gaps, pct_pe)
+                    (pts_xy, angle_deg, length_m, gap_m_total, gap_pct, n_gaps, pct_pe, pct_projected)
                 )
 
+        if polylines:
+            locked_m = sum(item[2] * item[7] / 100.0 for item in polylines)
+            feedback.pushInfo(
+                f'Proteção por contexto: {locked_m:.1f} m mantidos na referência '
+                'por vegetação isolada ou suporte insuficiente (campo pct_proj). '
+                'A proteção geométrica não confirma espécie nem transforma verde em falha.'
+            )
         return polylines, gap_segments
 
     def _offsets_from_plant_centers(
             self, row_signal, crop_dilated, s_rows, s_cols, row_f, col_f, deltas, delta_step,
             tie_prior, sub_s, spacing, is_straight, min_run, decay_len,
-            center_delta=None, center_weight=None):
+            center_delta=None, center_weight=None, return_context=False):
         """Estimate centres, reject competing rows, then fit bounded continuous offsets."""
         m_len, n_deltas = s_rows.shape
         zero = np.zeros(m_len, dtype=np.float64)
         missing = np.zeros(m_len, dtype=bool)
+        def finish(offset, support, protected=None):
+            if return_context:
+                return offset, support, (~support if protected is None else protected)
+            return offset, support
         if m_len < 3:
-            return zero, missing
+            return finish(zero, missing)
         pos_prof = np.maximum(0.0, ndi.map_coordinates(
             row_signal, [row_f, col_f], order=1, mode='constant', cval=0.0))
         fine = ndi.gaussian_filter(pos_prof, sigma=(1.0, 1.0), mode='nearest')
@@ -1261,6 +1278,10 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         observed = deltas[j] + sub_j * delta_step
         threshold = max(0.015, 0.30 * float(np.percentile(pos_prof, 95)))
         present = (v0 > threshold) & crop_dilated[s_rows[ar, j], s_cols[ar, j]]
+        # A broad, diffuse green patch is not sufficient evidence for a row.
+        width = np.sum(fine >= 0.5 * v0[:, None], axis=1) * delta_step
+        mean_profile = np.sum(np.where(corridor, fine, 0.0), axis=1) / np.maximum(1, corridor.sum(axis=1))
+        aligned = (width <= 0.65 * spacing) & (v0 >= 1.3 * mean_profile) & (v0 > threshold)
         confidence = np.where(present, 0.30, 0.0)
         precise = np.zeros(m_len, dtype=bool)
         if center_delta is not None:
@@ -1271,25 +1292,19 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             present |= precise
         idx = np.flatnonzero(present)
         if idx.size < 5:
-            return zero, missing
+            return finish(zero, missing)
         ps, pd = sub_s[idx], observed[idx]
         lo = np.searchsorted(ps, ps - 3.0)
         hi = np.searchsorted(ps, ps + 3.0, side='right')
         median = np.array([np.median(pd[a:b]) for a, b in zip(lo, hi)])
         accepted = np.abs(pd - median) <= max(0.12, 0.12 * spacing)
         present[idx[~accepted]] = False
-        # Coarse support must persist; an isolated RGB core can refine an established row.
-        idx = np.flatnonzero(present)
-        cuts = np.flatnonzero(np.diff(sub_s[idx]) > 0.75) + 1
-        support = np.zeros(m_len, dtype=bool)
-        for group in np.split(idx, cuts):
-            if group.size and (sub_s[group[-1]] - sub_s[group[0]] >= min_run
-                               or np.any(precise[group])):
-                support[group] = True
+        # RGB confidence never bypasses continuity and surrounding-gap checks.
+        support, protected = row_context_support(sub_s, present, aligned, min_run=min_run)
         confidence[~support] = 0.0
         idx = np.flatnonzero(support)
         if idx.size < 5:
-            return zero, missing
+            return finish(zero, missing, np.ones(m_len, dtype=bool))
         baseline = zero.copy()
         flex_limit = min(abs(float(deltas[0])), abs(float(deltas[-1])))
         slope_limit = 0.04
@@ -1313,9 +1328,10 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             slope_limit = max(0.005, 0.03 - abs(slope / scale))
         fitted = fit_center_offsets(
             sub_s, observed, confidence, baseline, max_flex=flex_limit,
-            max_slope=slope_limit, max_curvature=0.02)
+            max_slope=(0.03 if is_straight else 0.04) if np.any(protected) else slope_limit,
+            max_curvature=0.02, fixed_zero=protected if np.any(protected) else None)
         # No binary mask is applied here: that would introduce corners at gaps.
-        return fitted, support
+        return finish(fitted, support, protected)
 
     def _extract_planned_polylines(
             self, planned_layer, planned_transform, image_extent, feedback):
@@ -1349,7 +1365,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                     parts.append(coords)
         return parts
 
-    def _resample_and_smooth_planned_line(self, coords, step_m=0.50):
+    def _resample_and_smooth_planned_line(self, coords, step_m=0.50, preserve_geometry=False):
         pts = np.asarray(coords, dtype=np.float64)
         if len(pts) < 2:
             return None, None, None, False
@@ -1379,10 +1395,11 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             lat_dev = np.abs(-(xs - xs[0]) * uy + (ys - ys[0]) * ux)
             if float(lat_dev.max()) < 0.35:
                 is_straight = True
-                xs = xs[0] + s_grid * (chord_dx / total_len)
-                ys = ys[0] + s_grid * (chord_dy / total_len)
+                if not preserve_geometry:
+                    xs = xs[0] + s_grid * (chord_dx / total_len)
+                    ys = ys[0] + s_grid * (chord_dy / total_len)
 
-        if not is_straight and len(xs) >= 7:
+        if not preserve_geometry and not is_straight and len(xs) >= 7:
             xs_s = ndi.gaussian_filter1d(xs, sigma=2.5 / step_m, mode='nearest')
             ys_s = ndi.gaussian_filter1d(ys, sigma=2.5 / step_m, mode='nearest')
             taper = np.minimum(1.0, np.minimum(s_grid, total_len - s_grid) / 4.0)
@@ -1427,6 +1444,9 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             'as falhas de plantio ao longo de cada fileira.\n\n'
             'Para refinar os centros das touceiras, selecione o ortomosaico RGB original. '
             'Com um raster classificado de banda única, o ajuste usa a nuvem e a grade de cultura.\n\n'
+            'Manchas isoladas entre falhas e trechos sem continuidade confiável não '
+            'deslocam a referência; o percentual protegido aparece em pct_proj. '
+            'Essa proteção não identifica botanicamente plantas invasoras.\n\n'
             'Como funciona:\n'
             '1. Combina a nuvem de pontos da cultura com o contraste local da '
             'imagem de referência em uma grade métrica de alta resolução.\n'

@@ -70,7 +70,19 @@ O refinamento usa as linhas projetadas, quando disponíveis, ou as fileiras dete
 - **Sem linhas projetadas:** as linhas detectadas automaticamente passam pelo mesmo refinamento de centros.
 - **Raster sem RGB:** o algoritmo informa no log que usará a nuvem e a grade de cultura, com menor capacidade de localizar touceiras individuais.
 
-Os parâmetros de afastamento lateral e comprimento mínimo de suporte contínuo permanecem disponíveis. Núcleos RGB com evidência suficiente podem refinar trechos mais curtos. O campo **pct_pes** indica o percentual de segmentos com suporte aceito nas duas extremidades.
+Os parâmetros de afastamento lateral e comprimento mínimo de suporte contínuo permanecem disponíveis. A confiança do núcleo RGB não contorna mais o requisito de continuidade. O campo **pct_pes** indica o percentual de segmentos com suporte aceito nas duas extremidades.
+
+#### Proteção de manchas verdes cercadas por falhas
+
+O algoritmo avalia o contexto longitudinal e o perfil transversal antes de permitir que uma mancha verde desloque a linha:
+
+- Em uma janela de 8 m, exige pelo menos 50% de ocupação vegetal e 40% de apoio com perfil de fileira. Perfis largos ou sem pico transversal destacado não orientam o traçado.
+- Manchas separadas dos demais trechos por lacunas de pelo menos 1,5 m dos dois lados são rejeitadas como guia geométrico, mesmo com núcleos RGB fortes. Nas extremidades da imagem, exige 8 m de vazio observado para não confundir margens normais de cabeceira com isolamento.
+- Regiões com apoio insuficiente durante pelo menos o maior valor entre 2 m e o comprimento mínimo configurado (padrão: 3 m) também são protegidas. Pequenos intervalos normais entre touceiras continuam interpoláveis.
+- Nos trechos protegidos, o deslocamento é exatamente zero nos vértices amostrados: usa-se a geometria projetada, inclusive suas curvas. Nas bordas, o ajuste respeita os limites de inclinação e curvatura. Sem projeto informado, usa-se a fileira detectada como referência, sem inventar um projeto ausente.
+- O campo **pct_proj** registra o percentual do comprimento mantido na referência por essa proteção; o log informa o comprimento total protegido.
+
+Esses critérios são regras conservadoras deste projeto, não um classificador botânico validado. Uma touceira verdadeira isolada também deixa de orientar a linha, conforme a regra de uso. Vegetação ambígua não é automaticamente convertida em falha: os comprimentos de falha continuam derivados da cobertura vegetal. O bloqueio geométrico e a identificação de invasoras são decisões distintas.
 
 **Limites da interpretação:** o centro do núcleo visível é uma estimativa, não uma medição da base dos colmos. Folhas sobrepostas, plantas daninhas, sombras e resolução insuficiente podem ocultar a base. Os limites geométricos reduzem ondulações, mas não garantem acerto de todos os pés.
 
@@ -107,6 +119,8 @@ Em vez de assumir um único ângulo global reto para toda a propriedade, o algor
      - `falha_m`: Comprimento total somado das falhas de plantio ($\ge 0,5\text{ m}$) na fileira (m).
      - `falha_pct`: Percentual de falha da fileira (`0–100%`).
      - `num_falhas`: Quantidade de trechos de falha ($\ge 0,5\text{ m}$) contabilizados na fileira.
+     - `pct_pes`: Percentual do comprimento com apoio aceito para centralização.
+     - `pct_proj`: Percentual do comprimento protegido e mantido na referência por falta de apoio confiável.
   2. **Segmentos de falha de plantio (> 0,5 m) (`OUTPUT_GAPS`, opcional)**: Camada `LineString` demarcando exatamente a geometria de cada trecho de falha detectado ao longo das fileiras, com os atributos `falha_id`, `linha_id` e `compr_m`.
 
 ---
@@ -131,3 +145,5 @@ Em vez de assumir um único ângulo global reto para toda a propriedade, o algor
 - *Pixel-wise navigation line extraction of cross-growth-stage seedlings in complex sugarcane fields*: detecção de vegetação e ajuste de linhas de navegação. [Artigo](https://pmc.ncbi.nlm.nih.gov/articles/PMC11823478/)
 
 O uso conjunto de núcleo morfológico, votos de folhas e limites de flexão é uma implementação deste projeto, e ainda precisa ser validado com dados reais.
+
+O uso do contexto espacial e da organização em fileiras como evidência complementar é discutido por [Lottes et al., ICRA 2017](https://www.ipb.uni-bonn.de/wp-content/papercite-data/pdf/lottes17icra.pdf). A dificuldade de distinguir cana e invasoras em condições reais é documentada em [Papa et al., 2026](https://www.nature.com/articles/s44387-026-00096-0). Esses trabalhos motivam a decisão conservadora de preservar a referência na incerteza; não validam os limiares escolhidos aqui.

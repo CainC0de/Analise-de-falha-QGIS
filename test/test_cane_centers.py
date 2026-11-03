@@ -87,7 +87,8 @@ class CenterFitTests(unittest.TestCase):
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef))
         method = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
                       and n.name == '_offsets_from_plant_centers')
-        scope = {'np': np, 'ndi': ndi, 'fit_center_offsets': centers.fit_center_offsets}
+        scope = {'np': np, 'ndi': ndi, 'fit_center_offsets': centers.fit_center_offsets,
+                 'row_context_support': centers.row_context_support}
         exec(compile(ast.Module(body=[method], type_ignores=[]), '<algorithm>', 'exec'), scope)
         step, resolution = 0.25, 0.10
         s = np.arange(0, 25.01, step)
@@ -104,6 +105,102 @@ class CenterFitTests(unittest.TestCase):
             r, c, rows, cols, deltas, 0.04, np.ones(len(deltas)), s, 1.5, True, 3.0, 2.0)
         self.assertTrue(support.any())
         self.assertAlmostEqual(float(np.median(offset)), 0.15, delta=0.012)
+
+    def test_projected_lock_with_nonzero_healthy_baseline_is_smooth(self):
+        s = np.arange(0, 60.01, 0.25)
+        protected = (s >= 22) & (s <= 38)
+        baseline = np.full(len(s), 0.15)
+        confidence = (~protected).astype(float)
+        fitted = centers.fit_center_offsets(s, baseline, confidence, baseline,
+            fixed_zero=protected)
+        np.testing.assert_array_equal(fitted[protected], 0)
+        self.assertLess(np.max(np.abs(np.diff(fitted) / 0.25)), 0.030001)
+        self.assertLess(np.max(np.abs(np.diff(fitted, n=2) / 0.25 ** 2)), 0.020001)
+        self.assertGreater(np.median(fitted[s < 8]), 0.08)
+
+
+class RowContextTests(unittest.TestCase):
+    def setUp(self):
+        self.s = np.arange(0, 60.01, 0.25)
+
+    def test_large_green_island_surrounded_by_gaps_is_not_guidance(self):
+        occupied = (self.s >= 15) & (self.s <= 40)
+        trusted, protected = centers.row_context_support(self.s, occupied, occupied)
+        self.assertFalse(trusted.any())
+        self.assertTrue(protected.all())
+
+    def test_weed_islands_do_not_override_healthy_ends(self):
+        healthy = (self.s < 15) | (self.s > 45)
+        island = (self.s > 27) & (self.s < 31)
+        occupied = healthy | island
+        trusted, protected = centers.row_context_support(self.s, occupied, occupied)
+        self.assertTrue(trusted[self.s < 10].all())
+        self.assertTrue(trusted[self.s > 50].all())
+        self.assertFalse(trusted[island].any())
+        self.assertTrue(protected[island].all())
+
+    def test_diffuse_patch_cannot_steer_even_if_continuously_green(self):
+        trusted, protected = centers.row_context_support(self.s,
+            np.ones(len(self.s), dtype=bool), np.zeros(len(self.s), dtype=bool))
+        self.assertFalse(trusted.any())
+        self.assertTrue(protected.all())
+
+    def test_normal_short_interplant_gaps_remain_supported(self):
+        occupied = (self.s % 1.0) < 0.75
+        trusted, protected = centers.row_context_support(self.s, occupied, occupied)
+        self.assertTrue(trusted[occupied].all())
+        self.assertFalse(protected.any())
+
+    def test_short_headland_margins_do_not_reject_a_healthy_row(self):
+        occupied = (self.s >= 2) & (self.s <= 58)
+        trusted, protected = centers.row_context_support(self.s, occupied, occupied)
+        self.assertTrue(trusted[(self.s > 8) & (self.s < 52)].all())
+        self.assertFalse(protected[(self.s > 8) & (self.s < 52)].any())
+
+    def test_scattered_high_confidence_cores_cannot_supply_continuity(self):
+        occupied = (self.s % 3.0) == 0
+        trusted, protected = centers.row_context_support(self.s, occupied, occupied)
+        self.assertFalse(trusted.any())
+        self.assertTrue(protected.all())
+
+    def test_actual_algorithm_does_not_follow_confident_isolated_rgb(self):
+        tree = ast.parse((ROOT / 'RestituirLinhasAlgorithm.py').read_text(encoding='utf-8'))
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef))
+        method = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+                      and n.name == '_offsets_from_plant_centers')
+        scope = {'np': np, 'ndi': ndi, 'fit_center_offsets': centers.fit_center_offsets,
+                 'row_context_support': centers.row_context_support}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), '<algorithm>', 'exec'), scope)
+        s = self.s
+        deltas = np.arange(-0.65, 0.66, 0.04)
+        yy, xx = np.mgrid[:650, :40]
+        y_map = (yy + 0.5) * 0.1 - 1
+        island_image = (y_map > 27) & (y_map < 31)
+        signal = np.exp(-0.5 * ((xx - 22) / 1.1) ** 2) * island_image
+        cols = np.broadcast_to((2 + deltas) / 0.1 - 0.5, (len(s), len(deltas)))
+        rows = np.broadcast_to((s[:, None] + 1) / 0.1 - 0.5, cols.shape)
+        island = (s > 27) & (s < 31)
+        offset, support, protected = scope[method.name](None, signal,
+            signal > 0.1, np.floor(rows + 0.5).astype(int), np.floor(cols + 0.5).astype(int),
+            rows, cols, deltas, 0.04, np.ones(len(deltas)), s, 1.5, True, 3.0, 2.0,
+            np.full(len(s), 0.25), island.astype(float), return_context=True)
+        np.testing.assert_array_equal(offset, 0)
+        self.assertFalse(support.any())
+        self.assertTrue(protected.all())
+
+    def test_reference_curve_is_not_straightened_in_protected_mode(self):
+        import math
+        tree = ast.parse((ROOT / 'RestituirLinhasAlgorithm.py').read_text(encoding='utf-8'))
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef))
+        method = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+                      and n.name == '_resample_and_smooth_planned_line')
+        scope = {'np': np, 'ndi': ndi, 'math': math}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), '<algorithm>', 'exec'), scope)
+        coords = [(0, 0), (5, 0.25), (10, 0)]
+        s, xy, normals, straight = scope[method.name](None, coords, step_m=0.25,
+                                                     preserve_geometry=True)
+        self.assertGreater(xy[:, 1].max(), 0.24)
+        self.assertTrue(np.isfinite(normals).all())
 
 
 if __name__ == '__main__':

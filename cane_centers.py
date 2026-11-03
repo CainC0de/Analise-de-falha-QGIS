@@ -26,13 +26,69 @@ import numpy as np
 import scipy.ndimage as ndi
 
 
+def row_context_support(s, occupied, aligned, min_run=3.0, window_m=8.0,
+                        isolation_gap_m=1.5):
+    """Conservative geometry support, not a botanical crop/weed classifier.
+
+    Require sustained occupation and a narrow row signal. An island bracketed
+    by long gaps cannot steer a row, even when its RGB core has high confidence.
+    Returns trusted observations and regions locked to the reference geometry.
+    """
+    s = np.asarray(s, dtype=float)
+    occupied = np.asarray(occupied, dtype=bool)
+    aligned = np.asarray(aligned, dtype=bool)
+    trusted = np.zeros(s.size, dtype=bool)
+    if s.size < 2:
+        return trusted, ~trusted
+    h = float(np.median(np.diff(s)))
+    win = max(3, int(round(window_m / h)) | 1)
+    # Actual in-image window denominator: field ends are not assumed bare soil.
+    den = ndi.uniform_filter1d(np.ones(s.size), win, mode='constant')
+    coverage = ndi.uniform_filter1d(occupied.astype(float), win, mode='constant') / den
+    rowness = ndi.uniform_filter1d((occupied & aligned).astype(float), win, mode='constant') / den
+    contextual = (coverage >= 0.50) & (rowness >= 0.40)
+    idx = np.flatnonzero(occupied)
+    isolated = np.zeros(s.size, dtype=bool)
+    spans = np.zeros(s.size, dtype=bool)
+    groups = np.split(idx, np.flatnonzero(np.diff(s[idx]) > 0.75) + 1)
+    groups = [g for g in groups if g.size]
+    for i, group in enumerate(groups):
+        a, b = int(group[0]), int(group[-1])
+        left_gap = s[a] - (s[groups[i - 1][-1]] if i else s[0])
+        right_gap = (s[groups[i + 1][0]] if i + 1 < len(groups) else s[-1]) - s[b]
+        # At field/image ends require a full window of observed bare ground;
+        # ordinary headland margins must not invalidate an otherwise sound row.
+        left_required = isolation_gap_m if i else max(window_m, isolation_gap_m)
+        right_required = isolation_gap_m if i + 1 < len(groups) else max(window_m, isolation_gap_m)
+        surrounded = left_gap >= left_required and right_gap >= right_required
+        if surrounded:
+            isolated[a:b + 1] = True
+        elif s[b] - s[a] >= min_run:
+            spans[a:b + 1] = True
+    trusted = occupied & aligned & spans & contextual & ~isolated
+    # Sustained low support is protected, including a scattered succession of
+    # apparently strong cores. Short normal inter-plant gaps remain interpolable.
+    low = ~contextual
+    labels, _ = ndi.label(low)
+    protected = isolated.copy()
+    for extent in ndi.find_objects(labels):
+        if extent and (extent[0].stop - extent[0].start) * h >= max(2.0, min_run):
+            protected[extent[0]] = True
+    if not np.any(trusted):
+        protected[:] = True
+    trusted[protected] = False
+    return trusted, protected
+
+
 def fit_center_offsets(s, observed, confidence, baseline, max_flex=0.08,
-                       max_slope=0.03, max_curvature=0.02):
+                       max_slope=0.03, max_curvature=0.02, fixed_zero=None):
     """Robust penalized fit with explicit limits on lateral flexion and its derivatives.
 
     Missing observations have zero weight. They are interpolated continuously;
     never cut the fitted correction with a vegetation mask after fitting.
     Limits refer to the correction relative to baseline (metres, m/m, and 1/m).
+    With fixed_zero, protected vertices are eliminated exactly, the corridor
+    opens toward the reference, and derivative limits apply to the total offset.
     """
     from scipy import sparse
     from scipy.sparse.linalg import factorized
@@ -52,8 +108,13 @@ def fit_center_offsets(s, observed, confidence, baseline, max_flex=0.08,
     h = float(np.median(steps))
     weight = np.where(np.isfinite(observed) & np.isfinite(confidence),
                       np.clip(confidence, 0.0, 1.0), 0.0)
+    locked = None if fixed_zero is None else np.asarray(fixed_zero, dtype=bool)
+    if locked is not None:
+        if locked.shape != s.shape:
+            raise ValueError('Reference lock mask must match the distance array.')
+        weight[locked] = 0.0
     if not np.any(weight):
-        return baseline.copy()
+        return baseline.copy() if locked is None else np.zeros(n)
     target = np.where(weight > 0, observed - baseline, 0.0)
     eye = sparse.eye(n, format='csc')
     d1 = sparse.diags([-np.ones(n - 1), np.ones(n - 1)], [0, 1],
@@ -65,6 +126,18 @@ def fit_center_offsets(s, observed, confidence, baseline, max_flex=0.08,
                    np.full(n - 2, max_curvature)]
     if np.any(limits <= 0):
         raise ValueError('Flexion limits must be positive.')
+    lower, upper = -limits.copy(), limits.copy()
+    if locked is not None:
+        # Include the reference (zero offset) in the feasible corridor, so the
+        # entire transition can return to the project instead of just +/-8 cm.
+        lower[:n] = np.minimum(lower[:n], -baseline)
+        upper[:n] = np.maximum(upper[:n], -baseline)
+        lower[np.flatnonzero(locked)] = -baseline[locked]
+        upper[np.flatnonzero(locked)] = -baseline[locked]
+        # Derivative bounds now apply to the TOTAL offset, including baseline.
+        reference_derivatives = constraint @ baseline
+        lower[n:] -= reference_derivatives[n:]
+        upper[n:] -= reference_derivatives[n:]
     # Whittaker penalty, in metric units so results do not depend on sample step.
     penalty = 0.02 * eye + 0.10 * (d1.T @ d1) + 0.30 * (d2.T @ d2)
     rho = 0.5
@@ -74,12 +147,25 @@ def fit_center_offsets(s, observed, confidence, baseline, max_flex=0.08,
     flex = np.zeros(n)
     robust = weight.copy()
     for _ in range(3):
-        solve = factorized(sparse.diags(robust, format='csc') + penalty + gram)
-        for iteration in range(180):
+        matrix = sparse.diags(robust, format='csc') + penalty + gram
+        if locked is None:
+            solve = factorized(matrix)
+        else:
+            # Eliminate locked unknowns exactly. Merely penalizing their offset
+            # leaves tiny boundary errors that become kinks after zeroing.
+            free = ~locked
+            fixed = np.where(locked, -baseline, 0.0)
+            boundary_rhs = np.asarray(matrix @ fixed)[free]
+            solve_free = factorized(matrix[free][:, free].tocsc())
+            def solve(rhs):
+                answer = fixed.copy()
+                answer[free] = solve_free(rhs[free] - boundary_rhs)
+                return answer
+        for iteration in range(180 if locked is None else 1200):
             flex = solve(robust * target + rho * (constraint.T @ (z - dual)))
             values = constraint @ flex
             previous = z
-            z = np.clip(values + dual, -limits, limits)
+            z = np.clip(values + dual, lower, upper)
             dual += values - z
             if iteration > 20 and max(np.max(np.abs(values - z)),
                                        np.max(np.abs(z - previous))) < 1e-6:
@@ -88,10 +174,17 @@ def fit_center_offsets(s, observed, confidence, baseline, max_flex=0.08,
         robust = weight * np.minimum(1.0, 0.06 / np.maximum(residual, 1e-9))
     # Feasibility safeguard if ADMM reaches its iteration budget. Scaling keeps
     # continuity and all three bounds simultaneously, unlike sequential clipping.
-    ratio = float(np.max(np.abs(constraint @ flex) / limits))
-    if ratio > 1.0:
-        flex /= ratio
-    return baseline + flex
+    if locked is None:
+        ratio = float(np.max(np.abs(constraint @ flex) / limits))
+        if ratio > 1.0:
+            flex /= ratio
+        return baseline + flex
+    result = np.clip(baseline + flex, baseline + lower[:n], baseline + upper[:n])
+    result[locked] = 0.0
+    ratio = max(1.0, float(np.max(np.abs(d1 @ result))) / max_slope,
+                float(np.max(np.abs(d2 @ result))) / max_curvature)
+    # Scaling toward zero preserves the lock and the convex feasible corridor.
+    return result / ratio
 
 
 def chromatic_exg(r, g, b):
