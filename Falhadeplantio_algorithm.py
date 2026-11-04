@@ -12,6 +12,7 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsFeature,
+    QgsFeatureRequest,
     QgsFeatureSink,
     QgsField,
     QgsFields,
@@ -19,11 +20,19 @@ from qgis.core import (
     QgsPointXY,
     QgsProcessing,
     QgsProcessingAlgorithm,
+    QgsProcessingContext,
+    QgsProcessingOutputLayerDefinition,
     QgsProcessingException,
     QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterFeatureSource,
+    QgsProcessingParameterEnum,
+    QgsProcessingParameterCrs,
     QgsProcessingParameterNumber,
     QgsProcessingParameterRasterDestination,
     QgsProcessingParameterRasterLayer,
+    QgsProcessingUtils,
+    QgsVectorLayer,
+    QgsVectorFileWriter,
     QgsUnitTypes,
     QgsWkbTypes,
 )
@@ -31,6 +40,10 @@ from qgis.core import (
 
 class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
     INPUT_RASTER = 'INPUT_RASTER'
+    PREPARATION_MODE = 'PREPARATION_MODE'
+    MASK_LAYER = 'MASK_LAYER'
+    TARGET_CRS = 'TARGET_CRS'
+    OUTPUT_CLIPPED = 'OUTPUT_CLIPPED'
     RED_BAND = 'RED_BAND'
     GREEN_BAND = 'GREEN_BAND'
     BLUE_BAND = 'BLUE_BAND'
@@ -44,6 +57,18 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterRasterLayer(
             self.INPUT_RASTER,
             'Raster de entrada (imagem RGB)',
+        ))
+        self.addParameter(QgsProcessingParameterEnum(
+            self.PREPARATION_MODE, 'Preparação da imagem',
+            options=['Usar o raster diretamente (sem recorte)',
+                     'Recortar pelo polígono do talhão e processar'], defaultValue=0,
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSource(
+            self.MASK_LAYER, 'Polígono do talhão — obrigatório no modo de recorte',
+            types=[QgsProcessing.TypeVectorPolygon], optional=True,
+        ))
+        self.addParameter(QgsProcessingParameterCrs(
+            self.TARGET_CRS, 'CRS de saída (opcional; projetado em metros)', optional=True,
         ))
         for key, label, default in (
                 (self.RED_BAND, 'Banda vermelha (R)', 1),
@@ -85,6 +110,10 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             'Nuvem de pontos da cultura (GeoPackage)',
             type=QgsProcessing.TypeVectorPoint,
         ))
+        self.addParameter(QgsProcessingParameterRasterDestination(
+            self.OUTPUT_CLIPPED, 'Imagem RGB recortada e reprojetada (somente no modo de recorte)',
+            optional=True, createByDefault=False,
+        ))
 
     def processAlgorithm(self, parameters, context, feedback):
         raster = self.parameterAsRasterLayer(parameters, self.INPUT_RASTER, context)
@@ -94,6 +123,32 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         crs = raster.crs()
         if not crs.isValid():
             raise QgsProcessingException('O raster não tem um CRS válido definido.')
+
+        clip = self.parameterAsEnum(parameters, self.PREPARATION_MODE, context) == 1
+        mask = None
+        if clip:
+            mask = self.parameterAsSource(parameters, self.MASK_LAYER, context)
+            if mask is None:
+                raise QgsProcessingException('No modo de recorte, selecione o polígono do talhão.')
+            if QgsWkbTypes.geometryType(mask.wkbType()) != QgsWkbTypes.PolygonGeometry:
+                raise QgsProcessingException('A camada de recorte deve conter polígonos.')
+            if not mask.sourceCrs().isValid():
+                raise QgsProcessingException('O polígono do talhão não tem um CRS válido.')
+
+        explicit_crs = parameters.get(self.TARGET_CRS)
+        if isinstance(explicit_crs, QgsCoordinateReferenceSystem) and not explicit_crs.isValid():
+            explicit_crs = None  # Empty optional CRS widget in the Processing dialog.
+        output_crs = crs
+        if explicit_crs is not None and explicit_crs != '':
+            output_crs = self.parameterAsCrs(parameters, self.TARGET_CRS, context)
+            if (not output_crs.isValid() or output_crs.isGeographic()
+                    or output_crs.mapUnits() != QgsUnitTypes.DistanceMeters):
+                raise QgsProcessingException(
+                    'Escolha um CRS de saída projetado em metros (por exemplo, a zona UTM '
+                    'do talhão). O tamanho do pixel em centímetros requer unidades métricas.'
+                )
+        elif crs.isGeographic() or crs.mapUnits() != QgsUnitTypes.DistanceMeters:
+            output_crs = self._local_utm_crs(raster, crs, context)
 
         requested_pixel_cm = self.parameterAsDouble(
             parameters, self.PIXEL_SIZE_CM, context
@@ -106,6 +161,15 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
         green_band = self.parameterAsInt(parameters, self.GREEN_BAND, context)
         blue_band = self.parameterAsInt(parameters, self.BLUE_BAND, context)
         output_path = self.parameterAsOutputLayer(parameters, self.OUTPUT, context)
+        prepared_path = None
+        if clip:
+            prepared_path = self.parameterAsOutputLayer(parameters, self.OUTPUT_CLIPPED, context)
+            if not prepared_path:
+                prepared_path = QgsProcessingUtils.generateTempFilename('rgb_talhao.tif', context)
+        paths = [os.path.normcase(os.path.realpath(os.path.abspath(p)))
+                 for p in (raster.source(), output_path, prepared_path) if p]
+        if len(set(paths)) != len(paths):
+            raise QgsProcessingException('Use arquivos diferentes para o raster original, o RGB recortado e a classificação.')
 
         src = gdal.Open(raster.source(), gdal.GA_ReadOnly)
         if src is None:
@@ -139,19 +203,15 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
                 'O raster não tem sistema de referência espacial definido.'
             )
 
-        output_crs = crs
-        reproject_to_utm = (
-            crs.isGeographic() or crs.mapUnits() != QgsUnitTypes.DistanceMeters
-        )
-        if reproject_to_utm:
-            output_crs = self._local_utm_crs(raster, crs, context)
+        reproject = output_crs != crs
+        if reproject:
             native_res_m = self._estimate_metric_pixel_size(
                 raster, crs, output_crs, width, height, context
             )
             pixel_cm = max(requested_pixel_cm, native_res_m * 100.0 * 0.95)
             pixel_size_map_units = pixel_cm / 100.0
             feedback.pushInfo(
-                f'Raster em unidades não métricas: reprojetando via VRT para '
+                f'Reprojetando a imagem para '
                 f'{output_crs.authid()} com pixel de {pixel_cm:g} cm.'
             )
         else:
@@ -191,6 +251,16 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
 
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='falha_plantio_rgb_') as temp_dir:
+            cutline_path, cut_bounds, cut_geometry = None, None, None
+            cut_engine = None
+            if clip:
+                feedback.pushInfo('Preparando o polígono do talhão para recorte...')
+                cutline_path, cut_bounds, cut_geometry = self._prepare_cutline(
+                    mask, raster, output_crs, temp_dir, context, feedback)
+                if feedback.isCanceled():
+                    return {}
+                cut_engine = QgsGeometry.createGeometryEngine(cut_geometry.constGet())
+                cut_engine.prepareGeometry()
             band_list = [red_band, green_band, blue_band]
             if alpha_band is not None:
                 band_list.append(alpha_band)
@@ -206,29 +276,45 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
                 raise QgsProcessingException('Não foi possível preparar as bandas RGB.')
             vrt = None
 
-            need_warp = reproject_to_utm or (
+            need_warp = clip or reproject or (
                 abs(pixel_size_map_units - abs(transform[1])) > abs(transform[1]) * 0.05
             ) or (transform[2] != 0.0 or transform[4] != 0.0)
 
             if need_warp:
-                warped_vrt_path = os.path.join(temp_dir, 'rgb_warped.vrt')
+                warped_vrt_path = prepared_path if clip else os.path.join(temp_dir, 'rgb_warped.vrt')
                 warp_options = {
-                    'format': 'VRT',
+                    'format': 'GTiff' if clip else 'VRT',
                     'xRes': pixel_size_map_units,
                     'yRes': pixel_size_map_units,
                     'resampleAlg': 'bilinear',
                 }
-                if reproject_to_utm:
+                if reproject or clip:
                     warp_options['dstSRS'] = output_crs.toWkt()
                 else:
                     warp_options['outputBounds'] = bounds
-                warped = gdal.Warp(
-                    warped_vrt_path,
-                    vrt_path,
-                    options=gdal.WarpOptions(**warp_options),
-                )
+                if clip:
+                    os.makedirs(os.path.dirname(os.path.abspath(prepared_path)), exist_ok=True)
+                    warp_options.update(
+                        cutlineDSName=cutline_path, cutlineLayer='mask',
+                        outputBounds=cut_bounds, srcAlpha=alpha_band is not None,
+                        dstAlpha=True,
+                        creationOptions=['TILED=YES', 'COMPRESS=DEFLATE', 'BIGTIFF=IF_SAFER'],
+                        callback=lambda complete, message, data: self._warp_progress(complete, feedback),
+                    )
+                    feedback.pushInfo(f'Recortando e reprojetando RGB para {output_crs.authid()}...')
+                try:
+                    warped = gdal.Warp(
+                        warped_vrt_path, vrt_path,
+                        options=gdal.WarpOptions(**warp_options),
+                    )
+                except RuntimeError as exc:
+                    if feedback.isCanceled():
+                        return {}
+                    raise QgsProcessingException(f'Falha ao preparar o raster: {exc}')
                 if warped is None:
                     src = None
+                    if feedback.isCanceled():
+                        return {}
                     raise QgsProcessingException('Falha ao configurar grade de leitura RGB.')
                 warped = None
                 rgb = gdal.Open(warped_vrt_path, gdal.GA_ReadOnly)
@@ -246,6 +332,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
                 f'Grade de processamento: {out_width} × {out_height} pixels '
                 f'({pixel_cm:.2f} cm/px) em {output_crs.authid()}.'
             )
+            progress_start = 20.0 if clip else 0.0
 
             driver = gdal.GetDriverByName('GTiff')
             result = driver.Create(
@@ -373,7 +460,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
                         )
                         result_band.WriteArray(empty_tile, col0, row0)
                         tile_idx += 1
-                        feedback.setProgress(95.0 * tile_idx / total_tiles)
+                        feedback.setProgress(progress_start + (95.0 - progress_start) * tile_idx / total_tiles)
                         continue
 
                     veg_mask, crop_mask, gli = self._classify_window(
@@ -425,12 +512,11 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
 
                             for x_pt, y_pt, gli_pt, cnt_pt in zip(
                                     xs, ys, mean_glis, kept_counts):
+                                point_geometry = QgsGeometry.fromPointXY(QgsPointXY(float(x_pt), float(y_pt)))
+                                if cut_engine is not None and not cut_engine.intersects(point_geometry.constGet()):
+                                    continue
                                 feat = QgsFeature(point_fields)
-                                feat.setGeometry(
-                                    QgsGeometry.fromPointXY(
-                                        QgsPointXY(float(x_pt), float(y_pt))
-                                    )
-                                )
+                                feat.setGeometry(point_geometry)
                                 feat.setAttributes([float(gli_pt), 1, int(cnt_pt)])
                                 point_batch.append(feat)
                                 point_count += 1
@@ -443,7 +529,7 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
                                     point_batch = []
 
                     tile_idx += 1
-                    feedback.setProgress(95.0 * tile_idx / total_tiles)
+                    feedback.setProgress(progress_start + (95.0 - progress_start) * tile_idx / total_tiles)
 
             if point_batch and not point_sink.addFeatures(
                     point_batch, QgsFeatureSink.FastInsert):
@@ -462,7 +548,80 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             '255 = NoData.'
         )
         feedback.pushInfo(f'Pontos representativos da cultura gravados: {point_count}.')
-        return {self.OUTPUT: output_path, self.OUTPUT_POINTS: point_destination}
+        outputs = {self.OUTPUT: output_path, self.OUTPUT_POINTS: point_destination}
+        if clip:
+            outputs[self.OUTPUT_CLIPPED] = prepared_path
+            # GUI/runAndLoadResults requests loading through an output definition.
+            # Also load the automatically generated RGB when its path was omitted.
+            definition = parameters.get(self.OUTPUT)
+            if (isinstance(definition, QgsProcessingOutputLayerDefinition)
+                    and definition.destinationProject is not None
+                    and not context.willLoadLayerOnCompletion(prepared_path)):
+                context.addLayerToLoadOnCompletion(prepared_path, QgsProcessingContext.LayerDetails(
+                    'RGB do talhão — recortado e reprojetado', definition.destinationProject,
+                    self.OUTPUT_CLIPPED))
+            feedback.pushInfo('A classificação e a nuvem foram geradas a partir do RGB recortado, na mesma execução.')
+        return outputs
+
+    @staticmethod
+    def _warp_progress(complete, feedback):
+        feedback.setProgress(20.0 * complete)
+        return not feedback.isCanceled()
+
+    def _prepare_cutline(self, mask, raster, target_crs, temp_dir, context, feedback):
+        """Export polygon geometry (including holes) in the chosen output CRS."""
+        layer = QgsVectorLayer('MultiPolygon', 'mask', 'memory')
+        layer.setCrs(target_crs)
+        provider = layer.dataProvider()
+        transform = QgsCoordinateTransform(mask.sourceCrs(), target_crs, context.transformContext())
+        count = 0
+        batch = []
+        for feature in mask.getFeatures(QgsFeatureRequest().setNoAttributes()):
+            if feedback.isCanceled():
+                return None, None, None
+            geometry = QgsGeometry(feature.geometry())
+            if geometry.isNull() or geometry.isEmpty():
+                continue
+            if not geometry.isGeosValid():
+                raise QgsProcessingException(f'O polígono de ID {feature.id()} é inválido. Corrija a geometria antes do recorte.')
+            try:
+                geometry.transform(transform)
+            except Exception as exc:
+                raise QgsProcessingException(f'Não foi possível reprojetar o polígono de recorte: {exc}')
+            if not geometry.convertToMultiType():
+                raise QgsProcessingException('Não foi possível preparar a geometria poligonal para recorte.')
+            item = QgsFeature()
+            item.setGeometry(geometry)
+            batch.append(item)
+            count += 1
+            if len(batch) >= 1000:
+                if not provider.addFeatures(batch)[0]:
+                    raise QgsProcessingException('Falha ao preparar os polígonos do talhão.')
+                batch = []
+        if batch and not provider.addFeatures(batch)[0]:
+            raise QgsProcessingException('Falha ao preparar os polígonos do talhão.')
+        if not count:
+            raise QgsProcessingException('A camada de recorte não contém polígonos utilizáveis.')
+        layer.updateExtents()
+        tr = QgsCoordinateTransform(raster.crs(), target_crs, context.transformContext())
+        try:
+            raster_extent = tr.transformBoundingBox(raster.extent())
+        except Exception as exc:
+            raise QgsProcessingException(f'Não foi possível localizar a imagem no CRS de saída: {exc}')
+        bounds = layer.extent().intersect(raster_extent)
+        if bounds.isEmpty():
+            raise QgsProcessingException('O polígono do talhão não intersecta o raster selecionado.')
+        path = os.path.join(temp_dir, 'mask.gpkg')
+        options = QgsVectorFileWriter.SaveVectorOptions()
+        options.driverName = 'GPKG'
+        options.layerName = 'mask'
+        result = QgsVectorFileWriter.writeAsVectorFormatV3(layer, path, context.transformContext(), options)
+        if result[0] != QgsVectorFileWriter.NoError:
+            raise QgsProcessingException(f'Não foi possível exportar a máscara de recorte: {result[1]}')
+        geometry = QgsGeometry.unaryUnion([f.geometry() for f in layer.getFeatures()])
+        if geometry.isNull() or geometry.isEmpty():
+            raise QgsProcessingException('A máscara de recorte resultou em uma geometria vazia.')
+        return path, (bounds.xMinimum(), bounds.yMinimum(), bounds.xMaximum(), bounds.yMaximum()), geometry
 
     def _classify_window(self, red, green, blue, valid, pixel_size_m, gli_threshold):
         """
@@ -615,6 +774,15 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
 
     def shortHelpString(self):
         return (
+            'Preparação da imagem:\n'
+            '• Usar o raster diretamente: mantém o fluxo existente, sem máscara.\n'
+            '• Recortar pelo talhão: selecione a camada poligonal e, se desejar, '
+            'o CRS projetado em metros. Sem CRS informado, mantém o CRS métrico '
+            'da imagem ou escolhe a zona UTM local automaticamente.\n'
+            'No modo de recorte, o RGB recortado e reprojetado é salvo e usado '
+            'imediatamente para classificar e gerar os pontos, em uma única execução. '
+            'Deixe a saída RGB sem caminho para gerar um arquivo temporário. '
+            'O RGB recortado também pode ser usado depois na restituição das linhas.\n\n'
             'Classifica a cobertura vegetal de cana-de-açúcar em imagens RGB '
             'combinando os índices GLI = (2G − R − B)/(2G + R + B) e '
             'NGRDI = (G − R)/(G + R) com filtragem espacial adaptativa local '
@@ -624,10 +792,12 @@ class FalhaDePlantioAlgorithm(QgsProcessingAlgorithm):
             '255 = NoData/borda transparente).\n'
             '2. Uma nuvem de pontos GeoPackage centrada nas touceiras/fileiras '
             'da cultura (filtrando automaticamente manchas densas de mata/APP e '
-            'carreadores).\n\n'
-            'O processamento usa leitura direta em blocos via VRT (sem duplicar '
-            'dezenas de GB em arquivos temporários) e preserva a resolução '
-            'espacial efetiva da imagem.'
+            'carreadores).\n'
+            '3. No modo de recorte, o RGB recortado/reprojetado com transparência '
+            'fora do polígono e nos seus buracos.\n\n'
+            'No modo direto, a leitura usa blocos via VRT. No modo de recorte, '
+            'o RGB preparado é gravado uma única vez e alimenta a classificação '
+            'e a nuvem, preservando a resolução espacial efetiva da imagem.'
         )
 
     def helpUrl(self):

@@ -23,6 +23,19 @@ O fluxo do plugin é composto por duas ferramentas principais na Caixa de Ferram
 
 Classifica a cobertura vegetal da cana-de-açúcar em imagens RGB e gera simultaneamente um raster temático (GeoTIFF) e uma nuvem de pontos representativa das touceiras/fileiras da cultura (GeoPackage).
 
+### Escolha como preparar a imagem
+
+O campo **Preparação da imagem** oferece dois modos:
+
+1. **Usar o raster diretamente (sem recorte)**: selecione o RGB e execute como antes. A máscara é dispensada.
+2. **Recortar pelo polígono do talhão e processar**: selecione o RGB, informe a camada poligonal em **Polígono do talhão** e escolha o **CRS de saída**, se desejar. O algoritmo recorta a imagem, reprojeta, classifica e gera a nuvem de pontos na mesma execução.
+
+O CRS de saída deve ser **projetado em metros**, pois a resolução é informada em centímetros. Se deixar o CRS vazio, o plugin mantém o CRS métrico da imagem ou escolhe a zona UTM local automaticamente. O campo de CRS também pode ser usado no modo direto para reprojetar a classificação e os pontos.
+
+No modo de recorte, há uma terceira saída: **Imagem RGB recortada e reprojetada**. Escolha um GeoTIFF de destino ou deixe o caminho vazio para gerar um temporário. Essa imagem é usada imediatamente como entrada da classificação e da nuvem e fica disponível para a restituição das linhas. Ao executar pela interface com carregamento de resultados, o RGB gerado automaticamente também é carregado no mapa.
+
+Polígonos em outro CRS são transformados automaticamente. O recorte respeita partes separadas e buracos do polígono: o exterior fica transparente no RGB, com NoData na classificação, e os centroides dos pontos são conferidos contra a máscara. A imagem original é preservada. Máscaras vazias, inválidas ou sem interseção com a imagem são recusadas com uma mensagem explicativa.
+
 ### Metodologia de Classificação (v2.3)
 
 Em lavouras de cana-de-açúcar, o solo frequentemente está coberto por **palhada seca** (de coloração amarelada/bege, onde $R > G \gg B$) e sujeito a **sombras de nuvens** e variações radiométricas entre faixas de voo. O uso isolado do índice GLI com limiar fixo (`GLI > 0`) classifica erroneamente a palhada como vegetação verde, pois o baixo valor da banda Azul ($B$) torna $2G - R - B > 0$.
@@ -45,6 +58,9 @@ Para resolver esse problema de forma robusta, o algoritmo combina:
 ### Parâmetros de Entrada e Saída
 
 - **Raster de entrada (imagem RGB)**: Ortomosaico RGB (com ou sem banda Alpha). Se estiver em coordenadas geográficas (graus), é reprojetado automaticamente para a zona UTM métrica local.
+- **Preparação da imagem**: uso direto (padrão) ou recorte por polígono do talhão.
+- **Polígono do talhão**: camada poligonal obrigatória apenas no modo de recorte; aceita camadas temporárias e arquivos.
+- **CRS de saída**: opcional, projetado em metros; aplica-se à imagem preparada, à classificação e à nuvem.
 - **Bandas R, G e B**: Índices das bandas vermelha, verde e azul (padrão: `1`, `2`, `3`).
 - **Tamanho do pixel de saída (cm)**: Resolução desejada para o GeoTIFF classificado (padrão: `5,0 cm`; preserva a resolução nativa caso o raster original seja mais grosseiro, evitando superamostragem artificial).
 - **Espaçamento aproximado entre pontos da nuvem (cm)**: Tamanho da célula espacial usada para agregar pixels de cultura em um ponto centroide representativo (padrão: `20,0 cm`).
@@ -52,6 +68,7 @@ Para resolver esse problema de forma robusta, o algoritmo combina:
 - **Saídas**:
   - **Classificação de vegetação (GeoTIFF)**: `1` = vegetação verde (verde), `0` = palhada/solo sem vegetação (vermelho), `255` = NoData (transparente).
   - **Nuvem de pontos da cultura (GeoPackage)**: Camada vetorial `Point` contendo os atributos `gli` (GLI médio na célula), `classe` (`1`) e `pixel_count` (quantidade de pixels verdes agregados).
+  - **Imagem RGB recortada e reprojetada (GeoTIFF)**: gerada somente no modo de recorte; temporária ou salva no destino escolhido.
 
 ---
 
