@@ -11,6 +11,132 @@ gaps=importlib.util.module_from_spec(spec); spec.loader.exec_module(gaps)
 
 
 class GapTests(unittest.TestCase):
+    def _section(self,background,colour,width=.20,rows=20,dtype=float,centre=0.):
+        offsets=np.linspace(-.675,.675,45)
+        rgb=np.tile(np.array(background,dtype=dtype),(rows,45,1))
+        rgb[:,np.abs(offsets-centre)<width/2]=colour
+        return gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],
+            np.ones((rows,45),bool),offsets,1.5)
+
+    def test_bright_yellow_green_cane_does_not_require_darkness(self):
+        # G<R and plant is as bright as surrounding straw: old darkness gates
+        # rejected it. Its blue absorption and local contrast remain strong.
+        for scale in (.4,1.,2.):
+            states=self._section(np.array([168,152,125])*scale,
+                                 np.array([190,175,70])*scale)
+            np.testing.assert_array_equal(states,1)
+
+    def test_strong_chlorosis_without_green_support_is_review_not_gap(self):
+        states=self._section([168,152,125],[190,160,65])
+        np.testing.assert_array_equal(states,-2)
+        self.assertFalse(gaps.intervals_from_states(np.arange(21)*.05,states,.5)[0])
+
+    def test_yellow_soil_and_uniform_straw_do_not_become_crop(self):
+        for colour in ([190,175,70],[168,152,125],[185,115,75],[190,160,65]):
+            np.testing.assert_array_equal(self._section(colour,colour),0)
+
+    def test_uint8_and_float_inputs_produce_same_result(self):
+        a=self._section([168,152,125],[190,175,70],dtype=np.uint8)
+        b=self._section([168,152,125],[190,175,70])
+        np.testing.assert_array_equal(a,b)
+
+    def test_thin_leaf_cannot_hide_a_gap_but_off_axis_stool_can(self):
+        # One 3 cm sample over a long bare corridor is insufficient support.
+        thin=self._section([168,152,125],[60,200,45],width=.025,rows=60)
+        np.testing.assert_array_equal(thin,0)
+        found,_=gaps.intervals_from_states(np.arange(61)*.05,thin,.5)
+        self.assertEqual(len(found),1)
+        stool=self._section([168,152,125],[40,140,30],width=.14,centre=.27)
+        np.testing.assert_array_equal(stool,1)
+
+    def test_thin_dark_object_is_review_not_assumed_bare_ground(self):
+        states=self._section([168,152,125],[40,140,30],width=.025,rows=60)
+        np.testing.assert_array_equal(states,-2)
+
+    def test_outer_canopy_cannot_confirm_weak_foliage_inside_empty_corridor(self):
+        offsets=np.linspace(-.675,.675,45)
+        rgb=np.tile(np.array([168.,152.,125.]),(40,45,1))
+        rgb[:,(offsets<-.35)&(offsets>-.49)]=[50,150,35]
+        # Weak, bright leaf tips near the outer edge, no row seed inside.
+        rgb[:,(offsets>-.35)&(offsets<-.23)]=[160,159,125]
+        states=gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],
+            np.ones((40,45),bool),offsets,1.5)
+        self.assertFalse((states==1).any())
+        self.assertTrue((states==0).any())
+
+    def test_invalid_rgb_cannot_confirm_vegetation(self):
+        for colour in ([np.nan,150,20],[0,0,0],[100,np.inf,10],[-100,100,0]):
+            # No valid image in the central corridor; not a bare observation.
+            offsets=np.linspace(-.675,.675,45)
+            rgb=np.tile(np.array(colour),(20,45,1))
+            states=gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],
+                np.ones((20,45),bool),offsets,1.5)
+            np.testing.assert_array_equal(states,-1)
+
+    def test_yellow_cane_gap_across_raster_processing_blocks(self):
+        from osgeo import gdal,osr
+        class Feedback:
+            def isCanceled(self):return False
+        with tempfile.TemporaryDirectory() as temp:
+            path=str(Path(temp)/'yellow_cane.tif')
+            ds=gdal.GetDriverByName('GTiff').Create(path,800,100,3,gdal.GDT_Byte)
+            ds.SetGeoTransform((600000,.05,0,8090000,0,-.05))
+            srs=osr.SpatialReference();srs.ImportFromEPSG(31982);ds.SetProjection(srs.ExportToWkt())
+            yy,xx=np.mgrid[:100,:800]
+            # A 1.25 m gap crosses the 256-station (12.8 m) block boundary.
+            crop=(abs((yy+.5)*.05-2.5)<.12)&~((xx>=245)&(xx<270))
+            for i,(soil,cane) in enumerate(zip([168,152,125],[190,175,70]),1):
+                ds.GetRasterBand(i).WriteArray(np.where(crop,cane,soil).astype(np.uint8))
+            ds=None
+            sampler=gaps.GapRasterSampler(path,srs.ExportToWkt(),temp)
+            try:
+                e,c,n=gaps.sample_polyline([[600000,8089997.5],[600040,8089997.5]],.05)
+                states=sampler.states(c,n,1.5,Feedback())
+                found,_=gaps.intervals_from_states(e,states,.5)
+                self.assertEqual(len(found),1)
+                self.assertAlmostEqual(found[0][0],12.25,delta=.051)
+                self.assertAlmostEqual(found[0][1],13.5,delta=.051)
+                self.assertTrue((states[20:220]==1).all())
+                self.assertTrue((states[300:780]==1).all())
+            finally:sampler.close()
+
+    def test_raster_rgb_colour_metadata_overrides_physical_bgr_order(self):
+        from osgeo import gdal,osr
+        class Feedback:
+            def isCanceled(self):return False
+        with tempfile.TemporaryDirectory() as temp:
+            path=str(Path(temp)/'bgr.tif')
+            ds=gdal.GetDriverByName('GTiff').Create(path,200,80,3,gdal.GDT_Byte)
+            ds.SetGeoTransform((600000,.05,0,8090000,0,-.05))
+            srs=osr.SpatialReference();srs.ImportFromEPSG(31982);ds.SetProjection(srs.ExportToWkt())
+            yy,xx=np.mgrid[:80,:200];crop=abs((yy+.5)*.05-2)<.12
+            for i,(soil,cane,interpretation) in enumerate([(125,70,gdal.GCI_BlueBand),
+                    (152,175,gdal.GCI_GreenBand),(168,190,gdal.GCI_RedBand)],1):
+                ds.GetRasterBand(i).WriteArray(np.where(crop,cane,soil).astype(np.uint8))
+                ds.GetRasterBand(i).SetColorInterpretation(interpretation)
+            ds=None
+            sampler=gaps.GapRasterSampler(path,srs.ExportToWkt(),temp)
+            try:
+                e,c,n=gaps.sample_polyline([[600000.2,8089998],[600009.8,8089998]],.05)
+                states=sampler.states(c,n,1.5,Feedback())
+                self.assertTrue((states==1).all())
+            finally:sampler.close()
+
+    def test_nominal_50cm_not_lost_on_line_with_fractional_remainder(self):
+        edges,_,_=gaps.sample_polyline([[0,0],[10.013,0]],.05)
+        np.testing.assert_allclose(np.diff(edges)[:-1],.05)
+        states=np.ones(len(edges)-1,dtype=int);states[20:30]=0
+        found,_=gaps.intervals_from_states(edges,states,.5)
+        self.assertEqual(len(found),1)
+        self.assertAlmostEqual(found[0][1]-found[0][0],.5)
+
+    def test_review_intervals_are_separate_from_gaps(self):
+        edges=np.arange(7)*.25;states=[1,-2,-2,0,-1,1]
+        review=gaps.review_intervals(edges,states)
+        self.assertEqual([r[2] for r in review],['incerto','sem_dados'])
+        self.assertAlmostEqual(sum(b-a for a,b,_ in review),.75)
+        found,_=gaps.intervals_from_states(edges,states,.5)
+        self.assertFalse(found)
     def test_threshold_is_inclusive_and_does_not_include_crop_neighbours(self):
         edges=np.arange(9)*.1
         found,unknown=gaps.intervals_from_states(edges,[1,1,0,0,0,0,0,1],.5)
@@ -200,15 +326,22 @@ class GapTests(unittest.TestCase):
                 return [(pts,0.,10.,0.,0.,0,100.,0.)],[]
         for minimum in (50,150):
             alg=FixedRows(); alg.initAlgorithm()
-            result=alg.processAlgorithm({'INPUT_RASTER':path,'INPUT_POINTS':points.id(),
+            parameters={'INPUT_RASTER':path,'INPUT_POINTS':points.id(),
                 'INPUT_PLANNED_LINES':planned.id(),'MIN_GAP_CM':minimum,
-                'OUTPUT':'memory:','OUTPUT_GAPS':'memory:'},ctx,QgsProcessingFeedback())
+                'OUTPUT':'memory:','OUTPUT_GAPS':'memory:'}
+            if minimum==50:parameters['OUTPUT_REVIEW']='memory:'
+            result=alg.processAlgorithm(parameters,ctx,QgsProcessingFeedback())
             rows=QgsProcessingUtils.mapLayerFromString(result['OUTPUT'],ctx)
             segments=QgsProcessingUtils.mapLayerFromString(result['OUTPUT_GAPS'],ctx)
             self.assertEqual(rows.featureCount(),1)
             self.assertIn('sem_dados_m',rows.fields().names())
             self.assertIn('incerto_m',rows.fields().names())
             self.assertIn('categoria',segments.fields().names())
+            if minimum==50:
+                review=QgsProcessingUtils.mapLayerFromString(result['OUTPUT_REVIEW'],ctx)
+                self.assertIsNotNone(review)
+                self.assertTrue(any(f['motivo']=='sem_dados' for f in review.getFeatures()))
+            else:self.assertFalse(result.get('OUTPUT_REVIEW'))
             self.assertTrue(all(f['compr_m']+1e-6>=minimum/100 for f in segments.getFeatures()))
             outputs.append((bytes(next(rows.getFeatures()).geometry().asWkb()),segments.featureCount()))
         ctx.temporaryLayerStore().removeAllMapLayers()

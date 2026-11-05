@@ -10,7 +10,7 @@ import scipy.ndimage as ndi
 from scipy.signal import fftconvolve
 from scipy.spatial import cKDTree
 from .cane_centers import detect_stool_centers, fit_center_offsets, row_context_support
-from .planting_gaps import GapRasterSampler, intervals_from_states, sample_polyline, segment_coordinates
+from .planting_gaps import GapRasterSampler, intervals_from_states, sample_polyline, segment_coordinates, review_intervals
 from qgis.PyQt.QtCore import QVariant
 from qgis.core import (
     QgsCoordinateTransform,
@@ -46,6 +46,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
     MIN_GAP_CM = 'MIN_GAP_CM'
     OUTPUT = 'OUTPUT'
     OUTPUT_GAPS = 'OUTPUT_GAPS'
+    OUTPUT_REVIEW = 'OUTPUT_REVIEW'
     POINT_BATCH = 100000
 
     def initAlgorithm(self, config=None):
@@ -126,6 +127,10 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             type=QgsProcessing.TypeVectorLine,
             optional=True,
             createByDefault=True,
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUTPUT_REVIEW, 'Trechos incertos ou sem dados para revisão (opcional)',
+            type=QgsProcessing.TypeVectorLine, optional=True, createByDefault=False,
         ))
 
     def processAlgorithm(self, parameters, context, feedback):
@@ -311,8 +316,21 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                 'Confira o espaçamento informado e as camadas de entrada.'
             )
 
+        review_fields = QgsFields()
+        review_fields.append(QgsField('linha_id', QVariant.Int))
+        review_fields.append(QgsField('compr_m', QVariant.Double, len=14, prec=3))
+        review_fields.append(QgsField('motivo', QVariant.String, len=20))
+        review_sink, review_destination = self.parameterAsSink(
+            parameters, self.OUTPUT_REVIEW, context, review_fields, QgsWkbTypes.LineString, crs)
+        def record_review(line_id, points, length, reason):
+            feature=QgsFeature(review_fields)
+            feature.setGeometry(QgsGeometry.fromPolylineXY(points))
+            feature.setAttributes([line_id,length,reason])
+            if not review_sink.addFeature(feature,QgsFeatureSink.FastInsert):
+                raise QgsProcessingException('Falha ao gravar os trechos para revisão.')
         polylines, gap_segments = self._remeasure_gaps(
-            polylines, raster.source(), crs.toWkt(), spacing, feedback)
+            polylines, raster.source(), crs.toWkt(), spacing, feedback,
+            review_callback=record_review if review_sink is not None else None)
         if feedback.isCanceled():
             return {}
         fields = QgsFields()
@@ -408,6 +426,8 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         result = {self.OUTPUT: destination}
         if gap_destination is not None:
             result[self.OUTPUT_GAPS] = gap_destination
+        if review_destination is not None:
+            result[self.OUTPUT_REVIEW] = review_destination
         return result
 
     def _accumulate_points_grid(
@@ -1024,7 +1044,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             return pts_out
         return pts_arr
 
-    def _remeasure_gaps(self, polylines, source, target_wkt, spacing, feedback):
+    def _remeasure_gaps(self, polylines, source, target_wkt, spacing, feedback, review_callback=None):
         """Final measurement uses original imagery, never the dilated tracing mask."""
         measured, gaps = [], []
         minimum = self._min_gap_m
@@ -1048,6 +1068,11 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                     states = sampler.states(centres, normals, spacing, feedback)
                     intervals, unknown = intervals_from_states(
                         edges, states, minimum, min_crop_m=0.0)
+                    if review_callback is not None:
+                        for a,b,reason in review_intervals(edges,states):
+                            coordinates=segment_coordinates(xy,a,b)
+                            points=[QgsPointXY(float(x),float(y)) for x,y in coordinates]
+                            review_callback(i+1,points,b-a,reason)
                     total = sum(b-a for a,b,category in intervals)
                     base = list(item[:8]) if len(item) >= 8 else list(item[:6]) + [100., 0.]
                     base[3] = total
@@ -1485,6 +1510,10 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             'curva de nível, com terraço embutido ou em múltiplos talhões) e calcula '
             'as falhas de plantio ao longo de cada fileira.\n\n'
             'Para refinar os centros das touceiras, selecione o ortomosaico RGB original. '
+            'Use também o RGB original para medir falhas em cana amarelada; a máscara '
+            'binária não preserva essa informação de cor. A medição usa contraste '
+            'local, RGBVI e apoio espacial dentro da própria fileira. Amarelecimento '
+            'forte sem evidência suficiente permanece incerto para revisão. '
             'Com um raster classificado de banda única, o ajuste usa a nuvem e a grade de cultura.\n\n'
             'Manchas isoladas entre falhas e trechos sem continuidade confiável não '
             'deslocam a referência; o percentual protegido aparece em pct_proj. '
@@ -1510,4 +1539,6 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             'Classifica trechos como internos, iniciais, finais, totais ou '
             'junto a dados ausentes, gravando os atributos compr_m, '
             'falha_m, falha_pct e num_falhas, além da camada vetorial de falhas.'
+            '\n\nAtive a saída opcional "Trechos incertos ou sem dados para revisão" '
+            'para visualizar regiões não avaliadas, separadas das falhas confirmadas.'
         )

@@ -47,13 +47,17 @@ def classify_cross_sections(r, g, b, valid, offsets, spacing, longitudinal_step=
     Darkness or weak plant evidence is ambiguity, never proof of bare soil.
     Longitudinal observations are not dilated or filled over detected plants.
     """
-    offsets = np.asarray(offsets)
+    # Promote before arithmetic: uint8 band arrays otherwise wrap at 255.
+    r, g, b = [np.asarray(v,dtype=float) for v in (r,g,b)]
+    offsets = np.asarray(offsets,dtype=float)
+    cross_step = float(np.median(np.diff(offsets)))
     inner = np.abs(offsets) <= min(0.35, 0.28 * spacing)
     flank = np.abs(offsets) >= 0.35 * spacing
     total = r + g + b + 1e-9
     exg = (2*g-r-b)/total
     ngrdi = (g-r)/(g+r+1e-9)
-    valid = valid & np.isfinite(total)
+    valid = (np.asarray(valid,dtype=bool) & np.isfinite(total)
+             & (r>=0) & (g>=0) & (b>=0) & (total>1e-6))
     def background(values):
         data = np.where(valid[:,flank], values[:,flank], np.nan)
         # Avoid all-NaN median warnings while retaining missing-background flags.
@@ -62,29 +66,55 @@ def classify_cross_sections(r, g, b, valid, offsets, spacing, longitudinal_step=
         return med[:,None]
     bg_exg, bg_ngrdi, bg_light = [background(v) for v in (exg,ngrdi,total)]
     de, dn = exg-bg_exg, ngrdi-bg_ngrdi
+    # RGBVI and blue chromaticity retain evidence in yellow-green leaves even
+    # when R exceeds G. Local contrast, not yellowness alone, separates this
+    # evidence from the soil/straw surrounding the same cross section.
+    rgbvi = (g*g-r*b)/(g*g+r*b+1e-9)
+    blue = b/total
+    dv = rgbvi-background(rgbvi)
+    db = background(blue)-blue
     absolute = (exg > 0.10) & (ngrdi > 0.025) & (g > b)
     relative = ((exg > 0.08) & (ngrdi > -0.02) & (de > 0.045)
                 & (dn > 0.015) & (g > 1.04*b) & (total < 0.85*bg_light))
     olive = ((exg > 0.045) & (ngrdi > -0.075) & (de > 0.022)
              & (dn > 0.003) & (g > 1.04*b) & (total < 0.78*bg_light))
-    seed = (absolute | relative | olive) & valid
-    weak = (((de > 0.012) & (dn > 0) & (g>b) & (exg>0.02) & (ngrdi>-.085)) | absolute) & valid
+    yellow = ((exg>0.08) & (ngrdi>-.06) & (rgbvi>0.18)
+              & (dv>0.08) & (db>0.025) & (dn>-.015) & (g>1.18*b))
+    # Stronger chlorosis can overlap dry residue in RGB. Expose coherent
+    # objects as uncertain rather than asserting either crop or absence.
+    chlorotic = ((exg>0.04) & (ngrdi>-.16) & (rgbvi>0.10)
+                 & (dv>0.06) & (db>0.025) & (g>1.12*b)) & valid
+    seed = (absolute | relative | olive | yellow) & valid
+    weak = ((((de > 0.012) & (dn > 0) & (g>b) & (exg>0.02) & (ngrdi>-.085))
+             | absolute | chlorotic) & valid)
     # Hysteresis/connected objects: weak straw colour variations cannot on
     # their own confirm plants or split an otherwise empty planting row.
-    pixel_area = longitudinal_step * float(np.median(np.diff(offsets)))
+    pixel_area = longitudinal_step * cross_step
     labels, count = ndi.label(weak, structure=np.ones((3,3),dtype=bool))
     areas = np.bincount(labels.ravel(), minlength=count+1) * pixel_area
-    seeded = np.bincount(labels[seed], minlength=count+1)*pixel_area >= 0.003
+    # Attribute evidence to THIS row: strong colour in the outer flanks may
+    # belong to another clump. It cannot confirm a weak leaf/tail entering
+    # the corridor unless there is also a seed inside the evaluated corridor.
+    row_seed = seed & inner[None,:]
+    seeded = np.bincount(labels[row_seed], minlength=count+1)*pixel_area >= 0.003
     accepted = seeded & (areas >= 0.01)
     accepted[0] = False
     # Bound hysteresis growth: a cane seed must not flood a connected carpet
     # of straw that happens to be greener than reddish inter-row soil.
-    distance = ndi.distance_transform_edt(~seed, sampling=(longitudinal_step,float(np.median(np.diff(offsets)))))
+    distance = (ndi.distance_transform_edt(~row_seed, sampling=(longitudinal_step,cross_step))
+                if row_seed.any() else np.full(seed.shape,np.inf))
     vegetation = accepted[labels] & (distance <= 0.20)
-    crop = vegetation[:,inner].any(axis=1)
+    # One peripheral leaf/sample must not erase a 50 cm gap. Require a
+    # contiguous transverse support of 6 cm (or one native coarse sample),
+    # rather than adding unrelated specks across the full corridor. Off-axis
+    # clumps inside the corridor still count; the geometry is never moved.
+    needed = max(1,int(math.ceil(min(0.06,0.04*spacing)/cross_step-1e-9)))
+    supported = ndi.minimum_filter1d(vegetation[:,inner].astype(np.uint8),
+        size=needed,axis=1,mode='constant',cval=0).any(axis=1)
+    crop = supported
     # Only spatially coherent ambiguity interrupts absence. A single weak
     # colour pixel no longer resets the minimum-gap counter every few cm.
-    ambiguous_pixels = weak & (total < 0.90*bg_light) & ~vegetation
+    ambiguous_pixels = ((weak & (total < 0.90*bg_light)) | chlorotic) & ~vegetation
     ambiguous_labels, n_ambiguous = ndi.label(ambiguous_pixels, structure=np.ones((3,3),dtype=bool))
     ambiguous_areas = np.bincount(ambiguous_labels.ravel(), minlength=n_ambiguous+1)*pixel_area
     ambiguous = ambiguous_areas >= 0.025
@@ -102,13 +132,21 @@ def classify_cross_sections(r, g, b, valid, offsets, spacing, longitudinal_step=
 
 
 def sample_polyline(xy, step):
+    if not np.isfinite(step) or step <= 0:
+        raise ValueError('Sampling step must be positive.')
     xy = np.asarray(xy, dtype=float)
     lengths = np.linalg.norm(np.diff(xy, axis=0), axis=1)
     xy = np.vstack([xy[0], xy[1:][lengths > 1e-8]])
     if len(xy) < 2:
         raise ValueError('Line has no measurable length.')
     s = np.r_[0., np.cumsum(np.linalg.norm(np.diff(xy, axis=0), axis=1))]
-    edges = np.linspace(0., s[-1], max(1, int(math.ceil(s[-1] / step))) + 1)
+    # Keep full nominal steps. Redistributing the remainder via linspace makes
+    # ten nominal 5 cm cells slightly shorter than 50 cm and rejects the limit.
+    edges = np.arange(int(math.floor(s[-1] / step)) + 1,dtype=float)*step
+    if s[-1]-edges[-1] > 1e-9:
+        edges = np.r_[edges,s[-1]]
+    else:
+        edges[-1] = s[-1]
     stations = (edges[:-1] + edges[1:]) / 2
     segment = np.minimum(np.searchsorted(s, stations, side='right') - 1, len(xy)-2)
     tangent = xy[segment+1] - xy[segment]
@@ -116,6 +154,14 @@ def sample_polyline(xy, step):
     centres = np.column_stack([np.interp(stations, s, xy[:,i]) for i in (0,1)])
     normals = np.column_stack([-tangent[:,1], tangent[:,0]])
     return edges, centres, normals
+
+
+def review_intervals(edges, states):
+    """Expose unassessed intervals separately, without relabelling them gaps."""
+    edges=np.asarray(edges);states=np.asarray(states)
+    limits=np.r_[0,np.flatnonzero(np.diff(states)!=0)+1,len(states)]
+    return [(float(edges[a]),float(edges[b]),'sem_dados' if states[a]==-1 else 'incerto')
+            for a,b in zip(limits[:-1],limits[1:]) if b>a and states[a]<0]
 
 
 def segment_coordinates(xy, start, end):
@@ -134,6 +180,12 @@ class GapRasterSampler:
         if src is None:
             raise ValueError('Não foi possível abrir a imagem para medir falhas.')
         self.rgb = src.RasterCount >= 3
+        # Honour RGB colour metadata (e.g. a TIFF physically stored as B,G,R).
+        # Unlabelled RGB inputs retain the documented first-three-band order.
+        colours = {src.GetRasterBand(i).GetColorInterpretation():i
+                   for i in range(1,src.RasterCount+1)}
+        self.rgb_bands = tuple(colours.get(colour,default) for colour,default in
+            ((gdal.GCI_RedBand,1),(gdal.GCI_GreenBand,2),(gdal.GCI_BlueBand,3)))
         projected = gdal.AutoCreateWarpedVRT(src, None, target_wkt)
         if projected is None:
             raise ValueError('Não foi possível preparar a imagem para medir falhas.')
@@ -177,7 +229,7 @@ class GapRasterSampler:
             alpha=read(self.ds.GetRasterBand(self.ds.RasterCount))
             valid=np.isfinite(alpha) & (alpha>0)
             if self.rgb:
-                r,g,b=[read(self.ds.GetRasterBand(i)) for i in (1,2,3)]
+                r,g,b=[read(self.ds.GetRasterBand(i)) for i in self.rgb_bands]
                 states[start:stop] = classify_cross_sections(r,g,b,valid,offsets,spacing,along_step)[selection]
                 continue
             else:
