@@ -119,7 +119,20 @@ Em vez de assumir um único ângulo global reto para toda a propriedade, o algor
    - Os lóbulos negativos em $\pm S/2$ suprimem plantas daninhas na entrelinha, enquanto o suporte longitudinal e os harmônicos em $\pm S$ interpolam suavemente o centro da fileira através das falhas de plantio seguindo a curvatura das linhas vizinhas.
 4. **Rastreamento Sub-pixel de Cristas e Medição de Falhas**:
    - Extrai as cristas máximas na direção normal local com interpolação parabólica sub-pixel e rastreia cada fileira continuamente sem descontinuidade em $0^\circ / 180^\circ$.
-   - Ao longo de cada linha restituída, verifica a presença efetiva de cultura e identifica todos os trechos internos sem cobertura vegetal com extensão $\ge 0,50\text{ m}$ como **falhas de plantio**.
+   - A medição final é independente do traçado: amostra o raster original sem dilatação em uma faixa estreita central, evitando preencher falhas com folhas laterais ou vegetação de fileiras vizinhas. A geometria restituída é preservada.
+
+### Medição e categorização das falhas
+
+- **Tamanho mínimo para identificação como falha (cm)**: padrão **50 cm**; por exemplo, 100 considera somente trechos com pelo menos 1 m. O valor não altera a restituição nem o parâmetro de interpolação longitudinal.
+- A amostragem acompanha a distância ao longo das curvas, com passo de até 5 cm quando a resolução permite. Não se inventa resolução: pixels mais grosseiros limitam o detalhe, e mínimos inferiores a dois pixels geram aviso.
+- O perfil transversal usa até 20 cm de cada lado do eixo, limitado pelo espaçamento entre fileiras. Respostas verdes isoladas menores que o maior valor entre 10 cm e dois pixels, cercadas por ausência, não fragmentam uma falha. Isso reduz ruído, sem constituir identificação botânica de invasoras.
+- Os limites são medidos pelas bordas das células de amostragem. Os segmentos não incorporam o vértice vizinho com cultura, evitando o alongamento artificial da medição antiga.
+- Categorias: **interna**, **inicial**, **final**, **total** e **limite_dados** (adjacente a NoData). Falhas junto a dados ausentes podem continuar além da área observada.
+- NoData/transparência é registrado como **sem dados**, não como solo exposto. O percentual de falha usa somente o comprimento avaliado; linhas inteiramente sem dados têm percentual zero acompanhado de `sem_dados_m` igual ao comprimento total.
+
+O RGB indica cobertura vegetal visível, não a existência de colmos sob folhas sobrepostas. Dossel fechado e invasoras podem ocultar falhas. A escolha de uma época com menor fechamento de dossel e a conferência com medições de campo continuam necessárias. A regra de 50 cm é um padrão histórico, e o usuário pode alterá-la.
+
+Bases consultadas: [Maldaner et al., 2021 — comparação de sensores para medir falhas](https://www.sciencedirect.com/science/article/abs/pii/S1537511021001409), [Mapping Gaps in Sugarcane by UAV RGB Imagery](https://www.mdpi.com/2073-4395/11/12/2578) e [RGB Composition… Sugarcane Row Gaps](https://www.mdpi.com/2624-7402/7/1/17). A implementação combina amostragem por fileira, continuidade e tratamento de NoData; seus limiares não são uma calibração universal validada por esses artigos.
 
 ### Parâmetros e Atributos Gerados
 
@@ -133,12 +146,14 @@ Em vez de assumir um único ângulo global reto para toda a propriedade, o algor
      - `linha_id`: Identificador sequencial da fileira (`1, 2, ...`).
      - `angulo_graus`: Orientação média da fileira em graus (`0°–180°`).
      - `compr_m`: Comprimento total da fileira restituída (m).
-     - `falha_m`: Comprimento total somado das falhas de plantio ($\ge 0,5\text{ m}$) na fileira (m).
-     - `falha_pct`: Percentual de falha da fileira (`0–100%`).
-     - `num_falhas`: Quantidade de trechos de falha ($\ge 0,5\text{ m}$) contabilizados na fileira.
+     - `falha_m`: Comprimento total das falhas que atingem o mínimo configurado (m).
+     - `falha_pct`: Percentual de falha sobre o comprimento com dados (`0–100%`).
+     - `num_falhas`: Quantidade de trechos que atingem o mínimo configurado.
+     - `sem_dados_m`: Comprimento não avaliado por falta de imagem válida.
+     - `amostra_cm`: Passo efetivo de amostragem, em centímetros.
      - `pct_pes`: Percentual do comprimento com apoio aceito para centralização.
      - `pct_proj`: Percentual do comprimento protegido e mantido na referência por falta de apoio confiável.
-  2. **Segmentos de falha de plantio (> 0,5 m) (`OUTPUT_GAPS`, opcional)**: Camada `LineString` demarcando exatamente a geometria de cada trecho de falha detectado ao longo das fileiras, com os atributos `falha_id`, `linha_id` e `compr_m`.
+  2. **Segmentos de falha de plantio (`OUTPUT_GAPS`, opcional)**: camada `LineString` com `falha_id`, `linha_id`, `compr_m` e `categoria`, respeitando o mínimo configurado em centímetros.
 
 ---
 

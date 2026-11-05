@@ -10,6 +10,7 @@ import scipy.ndimage as ndi
 from scipy.signal import fftconvolve
 from scipy.spatial import cKDTree
 from .cane_centers import detect_stool_centers, fit_center_offsets, row_context_support
+from .planting_gaps import GapRasterSampler, intervals_from_states, sample_polyline, segment_coordinates
 from qgis.PyQt.QtCore import QVariant
 from qgis.core import (
     QgsCoordinateTransform,
@@ -42,6 +43,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
     MIN_POINTS_PER_BIN = 'MIN_POINTS_PER_BIN'
     PLANNED_MAX_OFFSET = 'PLANNED_MAX_OFFSET'
     MIN_CROP_RUN = 'MIN_CROP_RUN'
+    MIN_GAP_CM = 'MIN_GAP_CM'
     OUTPUT = 'OUTPUT'
     OUTPUT_GAPS = 'OUTPUT_GAPS'
     POINT_BATCH = 100000
@@ -109,6 +111,10 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             minValue=0.5,
             maxValue=10.0,
         ))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.MIN_GAP_CM, 'Tamanho mínimo para identificação como falha (cm)',
+            type=QgsProcessingParameterNumber.Double, defaultValue=50.0, minValue=1.0,
+        ))
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUTPUT,
             'Linhas de plantio restituídas',
@@ -116,7 +122,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         ))
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUTPUT_GAPS,
-            'Segmentos de falha de plantio (> 0,5 m)',
+            'Segmentos de falha de plantio (mínimo configurável)',
             type=QgsProcessing.TypeVectorLine,
             optional=True,
             createByDefault=True,
@@ -189,6 +195,9 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         min_points = self.parameterAsInt(parameters, self.MIN_POINTS_PER_BIN, context)
         planned_max_offset = self.parameterAsDouble(parameters, self.PLANNED_MAX_OFFSET, context)
         min_crop_run = self.parameterAsDouble(parameters, self.MIN_CROP_RUN, context)
+        self._min_gap_m = self.parameterAsDouble(parameters, self.MIN_GAP_CM, context) / 100.0
+        if not np.isfinite(self._min_gap_m) or self._min_gap_m <= 0:
+            raise QgsProcessingException('Informe um tamanho mínimo de falha positivo em centímetros.')
 
         work_extent = image_extent.intersect(combined_vec_extent)
         pad_m = max(2.0, spacing * 2.0)
@@ -302,6 +311,10 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                 'Confira o espaçamento informado e as camadas de entrada.'
             )
 
+        polylines, gap_segments = self._remeasure_gaps(
+            polylines, raster.source(), crs.toWkt(), spacing, feedback)
+        if feedback.isCanceled():
+            return {}
         fields = QgsFields()
         fields.append(QgsField('linha_id', QVariant.Int))
         fields.append(QgsField('angulo_graus', QVariant.Double, len=10, prec=2))
@@ -311,6 +324,8 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         fields.append(QgsField('num_falhas', QVariant.Int))
         fields.append(QgsField('pct_pes', QVariant.Double, len=10, prec=2))
         fields.append(QgsField('pct_proj', QVariant.Double, len=10, prec=2))
+        fields.append(QgsField('sem_dados_m', QVariant.Double, len=14, prec=2))
+        fields.append(QgsField('amostra_cm', QVariant.Double, len=10, prec=2))
 
         sink, destination = self.parameterAsSink(
             parameters, self.OUTPUT, context, fields,
@@ -323,6 +338,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         gap_fields.append(QgsField('falha_id', QVariant.Int))
         gap_fields.append(QgsField('linha_id', QVariant.Int))
         gap_fields.append(QgsField('compr_m', QVariant.Double, len=14, prec=2))
+        gap_fields.append(QgsField('categoria', QVariant.String, len=20))
         gap_sink, gap_destination = self.parameterAsSink(
             parameters, self.OUTPUT_GAPS, context, gap_fields,
             QgsWkbTypes.LineString, crs,
@@ -331,12 +347,14 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         line_batch = []
         total_length_m = 0.0
         total_gap_m = 0.0
+        total_known_m = 0.0
         for idx, item in enumerate(polylines):
             pts_xy, angle_deg, length_m, gap_m, gap_pct, n_gaps = item[:6]
             pct_pes = float(item[6]) if len(item) > 6 else 100.0
             pct_proj = float(item[7]) if len(item) > 7 else 0.0
             total_length_m += length_m
             total_gap_m += gap_m
+            total_known_m += max(0., length_m-float(item[8]))
             feat = QgsFeature(fields)
             feat.setGeometry(QgsGeometry.fromPolylineXY(pts_xy))
             feat.setAttributes([
@@ -348,6 +366,8 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                 int(n_gaps),
                 round(pct_pes, 2),
                 round(pct_proj, 2),
+                round(float(item[8]), 2),
+                round(float(item[9]), 2),
             ])
             line_batch.append(feat)
             if len(line_batch) >= 2000:
@@ -360,25 +380,28 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         gap_count = 0
         if gap_sink is not None and gap_segments:
             gap_batch = []
-            for g_idx, (line_id, g_pts, g_len) in enumerate(gap_segments):
+            for g_idx, (line_id, g_pts, g_len, category) in enumerate(gap_segments):
                 g_feat = QgsFeature(gap_fields)
                 g_feat.setGeometry(QgsGeometry.fromPolylineXY(g_pts))
-                g_feat.setAttributes([g_idx + 1, int(line_id), round(float(g_len), 2)])
+                g_feat.setAttributes([g_idx + 1, int(line_id), round(float(g_len), 2), category])
                 gap_batch.append(g_feat)
                 gap_count += 1
                 if len(gap_batch) >= 5000:
-                    gap_sink.addFeatures(gap_batch, QgsFeatureSink.FastInsert)
+                    if not gap_sink.addFeatures(gap_batch, QgsFeatureSink.FastInsert):
+                        raise QgsProcessingException('Falha ao gravar os segmentos de falha.')
                     gap_batch = []
             if gap_batch:
-                gap_sink.addFeatures(gap_batch, QgsFeatureSink.FastInsert)
+                if not gap_sink.addFeatures(gap_batch, QgsFeatureSink.FastInsert):
+                    raise QgsProcessingException('Falha ao gravar os segmentos finais de falha.')
 
-        overall_gap_pct = (100.0 * total_gap_m / total_length_m) if total_length_m > 0 else 0.0
+        overall_gap_pct = (100.0 * total_gap_m / total_known_m) if total_known_m > 0 else 0.0
         feedback.setProgress(100.0)
         feedback.pushInfo(
             f'Restituição concluída: {len(polylines)} linha(s) restituída(s) '
             f'({total_length_m:.1f} m totais). '
-            f'Falhas detectadas: {gap_count} trecho(s) somando {total_gap_m:.1f} m '
-            f'({overall_gap_pct:.1f}% de falha geral).'
+            f'Falhas detectadas: {len(gap_segments)} trecho(s) somando {total_gap_m:.1f} m '
+            f'({overall_gap_pct:.1f}% do comprimento avaliado; '
+            f'{total_length_m-total_known_m:.1f} m sem dados).'
         )
         result = {self.OUTPUT: destination}
         if gap_destination is not None:
@@ -997,47 +1020,59 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             return pts_out
         return pts_arr
 
+    def _remeasure_gaps(self, polylines, source, target_wkt, spacing, feedback):
+        """Final measurement uses original imagery, never the dilated tracing mask."""
+        measured, gaps = [], []
+        minimum = self._min_gap_m
+        feedback.pushInfo(f'Medindo falhas no raster sem dilatação; mínimo: {minimum*100:g} cm...')
+        with tempfile.TemporaryDirectory(prefix='cane_gap_measurement_') as directory:
+            try:
+                sampler = GapRasterSampler(source, target_wkt, directory)
+            except (RuntimeError, ValueError) as exc:
+                raise QgsProcessingException(str(exc))
+            try:
+                step = max(sampler.res, min(0.05, minimum / 4.0))
+                feedback.pushInfo(f'Passo de avaliação de falhas: {step*100:.2f} cm.')
+                if minimum < 2 * sampler.res:
+                    feedback.reportError('O mínimo solicitado é inferior a dois pixels da imagem; '
+                                         'a resolução limita a detecção dessas falhas pequenas.', False)
+                for i, item in enumerate(polylines):
+                    if feedback.isCanceled():
+                        return [], []
+                    xy = np.array([(p.x(), p.y()) for p in item[0]], dtype=float)
+                    edges, centres, normals = sample_polyline(xy, step)
+                    states = sampler.states(centres, normals, spacing, feedback)
+                    intervals, unknown = intervals_from_states(
+                        edges, states, minimum, min_crop_m=max(2*sampler.res, 0.10))
+                    total = sum(b-a for a,b,category in intervals)
+                    base = list(item[:8]) if len(item) >= 8 else list(item[:6]) + [100., 0.]
+                    base[3] = total
+                    base[4] = 100. * total / max(1e-9, edges[-1]-unknown)
+                    base[5] = len(intervals)
+                    measured.append(tuple(base) + (unknown, (edges[1]-edges[0])*100))
+                    for a,b,category in intervals:
+                        coords = segment_coordinates(xy,a,b)
+                        points = [QgsPointXY(float(x),float(y)) for x,y in coords]
+                        gaps.append((i+1, points, b-a, category))
+                    feedback.setProgress(95.0 + 4.0*(i+1)/max(1,len(polylines)))
+            finally:
+                sampler.close()
+        return measured, gaps
+
     def _measure_line_gaps(self, xs_map, ys_map, seg_lens, vertex_has_crop, line_id):
-        gap_m_total = 0.0
-        n_gaps = 0
-        in_gap = False
-        gap_start_idx = 0
-        line_gaps = []
-        n_verts = len(xs_map)
-
-        for v_i in range(n_verts):
-            if not vertex_has_crop[v_i]:
-                if not in_gap:
-                    in_gap = True
-                    gap_start_idx = max(0, v_i - 1)
-            else:
-                if in_gap:
-                    in_gap = False
-                    gap_end_idx = v_i
-                    g_len = float(seg_lens[gap_start_idx:gap_end_idx].sum())
-                    if g_len >= 0.50:
-                        gap_m_total += g_len
-                        n_gaps += 1
-                        g_pts = [
-                            QgsPointXY(float(xs_map[k]), float(ys_map[k]))
-                            for k in range(gap_start_idx, gap_end_idx + 1)
-                        ]
-                        line_gaps.append((line_id, g_pts, g_len))
-
-        if in_gap:
-            gap_end_idx = n_verts - 1
-            if gap_end_idx > gap_start_idx:
-                g_len = float(seg_lens[gap_start_idx:gap_end_idx].sum())
-                if g_len >= 0.50:
-                    gap_m_total += g_len
-                    n_gaps += 1
-                    g_pts = [
-                        QgsPointXY(float(xs_map[k]), float(ys_map[k]))
-                        for k in range(gap_start_idx, gap_end_idx + 1)
-                    ]
-                    line_gaps.append((line_id, g_pts, g_len))
-
-        return gap_m_total, n_gaps, line_gaps
+        # Coarse tracing diagnostics only; final results are recomputed from RGB.
+        if len(xs_map) < 2:
+            return 0., 0, []
+        distances = np.r_[0., np.cumsum(seg_lens)]
+        edges = np.r_[0., (distances[:-1]+distances[1:])/2, distances[-1]]
+        intervals, _ = intervals_from_states(
+            edges, np.where(vertex_has_crop,1,0), getattr(self,'_min_gap_m',0.5), min_crop_m=0.)
+        xy = np.column_stack([xs_map,ys_map])
+        result = []
+        for a,b,category in intervals:
+            coordinates = segment_coordinates(xy,a,b)
+            result.append((line_id,[QgsPointXY(float(x),float(y)) for x,y in coordinates],b-a))
+        return sum(b-a for a,b,category in intervals), len(result), result
 
     def _reconstruct_from_planned_lines(
             self, planned_layer, planned_transform, image_extent,
@@ -1462,7 +1497,10 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             '   - Estima o campo 2D de orientação local via FFT em janelas e aplica '
             'filtragem direcional adaptativa (comb filter) com retificação automática '
             'de tiros retos, seguida do mesmo refinamento de centros com flexão limitada.\n'
-            '4. Mede automaticamente todos os trechos de falha (>= 0,5 m sem cultura) '
-            'ao longo de cada linha restituída, gravando os atributos compr_m, '
+            '4. Mede a ausência de vegetação no raster original, em faixa estreita '
+            'sem dilatação. O tamanho mínimo é configurado em centímetros '
+            '(padrão: 50 cm). NoData não é considerado falha. '
+            'Classifica trechos como internos, iniciais, finais, totais ou '
+            'junto a dados ausentes, gravando os atributos compr_m, '
             'falha_m, falha_pct e num_falhas, além da camada vetorial de falhas.'
         )

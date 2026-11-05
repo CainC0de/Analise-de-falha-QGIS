@@ -6,7 +6,8 @@ SOURCES = \
 	Falhadeplantio_algorithm.py \
 	Falhadeplantio_provider.py \
 	RestituirLinhasAlgorithm.py \
-	cane_centers.py
+	cane_centers.py \
+	planting_gaps.py
 
 PLUGINNAME = Falhadeplantio
 
@@ -16,7 +17,8 @@ PY_FILES = \
 	Falhadeplantio_algorithm.py \
 	Falhadeplantio_provider.py \
 	RestituirLinhasAlgorithm.py \
-	cane_centers.py
+	cane_centers.py \
+	planting_gaps.py
 
 UI_FILES =
 
