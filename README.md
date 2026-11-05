@@ -127,10 +127,11 @@ Em vez de assumir um único ângulo global reto para toda a propriedade, o algor
 - A amostragem acompanha a distância ao longo das curvas, com passo de até 5 cm quando a resolução permite. Não se inventa resolução: pixels mais grosseiros limitam o detalhe, e mínimos inferiores a dois pixels geram aviso.
 - O perfil transversal avalia a faixa da fileira até 35 cm de cada lado do eixo, limitada a 28% do espaçamento. Amostras externas, ainda dentro de meia entrelinha, estimam a cor local do solo. A comparação de cromaticidade com esse fundo permite reconhecer cana oliva/amarelada sem exigir que o verde seja maior que o vermelho.
 - Os intervalos usam passos completos (por exemplo, 5 cm), deixando somente a última célula com o restante do comprimento. Isso evita descartar uma falha no limite de 50 cm porque a divisão uniforme da linha produziu dez células ligeiramente menores que 5 cm.
-- Duas amostras transversais adjacentes com evidência vegetal podem confirmar presença em qualquer posição da faixa; a planta não precisa cair exatamente no eixo. Evidência fraca, sombra ou falta de fundo comparável é marcada como **incerta**, em vez de ser convertida diretamente em ausência.
+- O apoio transversal de cada objeto confirma presença em qualquer posição da faixa; a planta não precisa cair exatamente no eixo. Evidência fraca, sombra ou falta de fundo comparável é marcada como **incerta**, em vez de ser convertida diretamente em ausência.
 - Presença confirmada, mesmo em um trecho longitudinal curto, interrompe a falha. A medição final não apaga plantas com um filtro de comprimento nem junta ausências através de plantas ou regiões incertas. A detecção geométrica de fileiras e sua proteção contra manchas isoladas continuam independentes dessa medição.
 - A confirmação usa objetos conectados no perfil da fileira: sementes de cor vegetal e contraste são expandidas somente sobre evidência fraca conectada e até 20 cm da semente. O núcleo deve ter pelo menos 0,003 m² de amostras e o objeto 0,01 m². Isso impede que uma touceira confirme um tapete inteiro de palhada conectado por variações de cor.
-- A semente precisa estar dentro da faixa da própria fileira. Cor vegetal nas faixas externas não confirma, sozinha, folhas fracas que entram na faixa central. A confirmação também exige apoio transversal contíguo de 6 cm para espaçamento de 1,5 m (4% do espaçamento, limitado a 6 cm e quantizado pela resolução). Uma ponta fina de folha não basta para confirmar cultura; objetos escuros ainda podem permanecer incertos.
+- A semente precisa estar dentro da faixa da própria fileira. A largura mínima contígua parte de 4% do espaçamento, limitada a 6 cm, e se adapta à metade da largura típica de cada objeto, até 15 cm. Isso reduz a influência de bordas parciais e pontas de folhas sem impor a largura de uma touceira grande às pequenas isoladas. Objetos escuros sem confirmação suficiente ainda podem permanecer incertos.
+- Na medição, o RGB e a máscara de validade são amostrados no pixel nativo mais próximo. Evita-se a mistura bilinear de folhas com solo que expandia a presença vegetal e eliminava falhas próximas do mínimo. O mínimo configurado não é reduzido. A reprojeção, quando necessária, continua sujeita ao detalhe disponível na imagem.
 - Para cana moderadamente amarelada e clara, o perfil combina RGBVI `(G² − R×B)/(G² + R×B)`, proporção de azul e contraste com a entrelinha, sem exigir que G seja maior que R nem que a planta seja escura. Amarelecimento forte com contraste coerente, mas sem confirmação suficiente, gera revisão em vez de uma falha automática. Palhada amarela uniforme não confirma cultura apenas pela cor. Esses critérios são heurísticos, não um diagnóstico de clorose nem uma classificação botânica.
 - A medição respeita os metadados das bandas vermelha, verde e azul do TIFF; sem esses metadados, usa as bandas 1, 2 e 3 nessa ordem. Para avaliar cana amarelada, informe o **RGB original como imagem de referência**: uma máscara binária já perdeu essa informação de cor e não permite recuperá-la.
 - Variações fracas e dispersas de palhada não reiniciam o contador de ausência. Sombras coerentes e objetos ambíguos com apoio espacial suficiente continuam incertos; não se unem falhas através deles. A decisão considera áreas físicas, com vizinhança adicional entre blocos para reduzir efeitos das emendas de processamento.
@@ -141,6 +142,13 @@ Em vez de assumir um único ângulo global reto para toda a propriedade, o algor
 O RGB indica cobertura vegetal visível, não a existência de colmos sob folhas sobrepostas. Dossel fechado e invasoras podem ocultar falhas. A escolha de uma época com menor fechamento de dossel e a conferência com medições de campo continuam necessárias. A regra de 50 cm é um padrão histórico, e o usuário pode alterá-la.
 
 A máscara de cobertura válida do raster é separada da classificação de vegetação. Rejeitar uma área densa como guia de cultura não remove a geometria de uma linha projetada dentro da imagem. Partes projetadas só são recortadas por limites/NoData da imagem, mantendo os filtros mínimos de comprimento da restituição.
+
+### Continuidade e origem das linhas (2.4)
+
+- O recorte da geometria usa a cobertura válida nativa do raster e refina as transições junto às bordas, evitando terminar uma linha no vértice anterior da grade de 25 cm.
+- No modo automático, primeiro são refinadas as fileiras observadas. Um modelo comum de curvatura usa somente apoio de cultura aceito para melhorar trechos protegidos e as extremidades, com extensão limitada e recorte pela imagem. A inferência de fileiras vazias é restrita ao interior de vizinhas paralelas, com espaçamento regular, sobreposição longitudinal suficiente e controle de duplicações. Não são criadas novas fileiras além das externas observadas.
+- Um projeto deslocado pode transferir seu registro às fileiras sem apoio próprio somente quando pelo menos três fileiras com cultura apresentam deslocamento pequeno e coerente. Uma mancha isolada não fornece esse registro.
+- O campo **origem** distingue `projeto`, `projeto_registrado`, `observada` e `inferida_entre_vizinhas`. Uma geometria inferida descreve a hipótese de continuidade do plantio, não uma observação de cultura onde há solo vazio.
 
 Bases consultadas: [Maldaner et al., 2021 — comparação de sensores para medir falhas](https://www.sciencedirect.com/science/article/abs/pii/S1537511021001409), [Mapping Gaps in Sugarcane by UAV RGB Imagery](https://www.mdpi.com/2073-4395/11/12/2578) e [RGB Composition… Sugarcane Row Gaps](https://www.mdpi.com/2624-7402/7/1/17). A implementação combina amostragem por fileira, continuidade e tratamento de NoData; seus limiares não são uma calibração universal validada por esses artigos.
 
@@ -168,6 +176,7 @@ A avaliação de diferentes índices/limiares e a dependência das condições d
      - `amostra_cm`: Passo efetivo de amostragem, em centímetros.
      - `pct_pes`: Percentual do comprimento com apoio aceito para centralização.
      - `pct_proj`: Percentual do comprimento protegido e mantido na referência por falta de apoio confiável.
+     - `origem`: Proveniência geométrica da fileira; identifica a inferência entre vizinhas e o registro de projeto.
   2. **Segmentos de falha de plantio (`OUTPUT_GAPS`, opcional)**: camada `LineString` com `falha_id`, `linha_id`, `compr_m` e `categoria`, respeitando o mínimo configurado em centímetros.
   3. **Trechos incertos ou sem dados para revisão (`OUTPUT_REVIEW`, opcional)**: ative esta saída para visualizar onde o algoritmo não conseguiu concluir presença ou ausência. Contém `linha_id`, `compr_m` e `motivo` (`incerto` ou `sem_dados`). Esses trechos não são falhas confirmadas e não são filtrados pelo mínimo de falha. A saída é dispensável no fluxo normal e não altera as linhas.
 
@@ -176,6 +185,8 @@ Em comparações com outras ferramentas, alinhe o mínimo de falha, a área aval
 ---
 
 ## Referências Metodológicas
+
+O estado de aprovação, o escopo e as instruções para reproduzir os testes estão em [VALIDACAO.md](VALIDACAO.md). Após a reestruturação 2.4, os nove cenários da bateria de aceitação passaram pelos critérios originais. Essa aprovação é restrita aos ensaios executados; não é uma estimativa de acurácia agronômica em todos os talhões.
 
 - Rocha et al. (2023) — *Automatic detection and evaluation of sugarcane planting rows from UAV RGB imagery* ([DOI: 10.1016/j.inpa.2022.04.003](https://doi.org/10.1016/j.inpa.2022.04.003))
 - Souza et al. (2017) — *Mapping skips in sugarcane fields using object-based image analysis* ([DOI: 10.1016/j.compag.2017.10.006](https://doi.org/10.1016/j.compag.2017.10.006))

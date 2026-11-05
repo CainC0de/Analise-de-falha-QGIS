@@ -108,10 +108,19 @@ def classify_cross_sections(r, g, b, valid, offsets, spacing, longitudinal_step=
     # contiguous transverse support of 6 cm (or one native coarse sample),
     # rather than adding unrelated specks across the full corridor. Off-axis
     # clumps inside the corridor still count; the geometry is never moved.
-    needed = max(1,int(math.ceil(min(0.06,0.04*spacing)/cross_step-1e-9)))
-    supported = ndi.minimum_filter1d(vegetation[:,inner].astype(np.uint8),
-        size=needed,axis=1,mode='constant',cval=0).any(axis=1)
-    crop = supported
+    crop=np.zeros(len(r),dtype=bool);core_objects=np.zeros(count+1,dtype=bool)
+    columns=np.arange(inner.sum())[None,:]
+    for obj in np.unique(labels[vegetation]):
+        mask=vegetation[:,inner]&(labels[:,inner]==obj)
+        last_empty=np.maximum.accumulate(np.where(~mask,columns,-1),axis=1)
+        runs=np.where(mask,columns-last_empty,0).max(axis=1)*cross_step
+        present=runs>0
+        if not present.any():continue
+        # A partially sampled outer edge is not the middle of this object.
+        # Scale to each object, so genuinely small isolated stools still count.
+        width=max(min(.06,.04*spacing),min(.15,.5*float(np.quantile(runs[present],.8))))
+        supported=runs+1e-9>=width
+        crop|=supported;core_objects[obj]=supported.any()
     # Only spatially coherent ambiguity interrupts absence. A single weak
     # colour pixel no longer resets the minimum-gap counter every few cm.
     ambiguous_pixels = ((weak & (total < 0.90*bg_light)) | chlorotic) & ~vegetation
@@ -119,7 +128,8 @@ def classify_cross_sections(r, g, b, valid, offsets, spacing, longitudinal_step=
     ambiguous_areas = np.bincount(ambiguous_labels.ravel(), minlength=n_ambiguous+1)*pixel_area
     ambiguous = ambiguous_areas >= 0.025
     ambiguous[0] = False
-    dark = (total < 0.65*bg_light) & valid
+    periphery=vegetation&core_objects[labels]&~crop[:,None]
+    dark = (total < 0.65*bg_light) & valid & ~periphery
     dark_labels, dark_count = ndi.label(dark, structure=np.ones((3,3),dtype=bool))
     dark_areas = np.bincount(dark_labels.ravel(), minlength=dark_count+1) * pixel_area
     dark_objects = dark_areas >= 0.01
@@ -200,6 +210,23 @@ class GapRasterSampler:
             raise ValueError('Não foi possível criar a grade de medição de falhas.')
         self.gt = self.ds.GetGeoTransform()
 
+    def valid_points(self, xy):
+        """Native pixel-footprint validity; no interpolation across mask holes."""
+        xy=np.asarray(xy,dtype=float);result=np.zeros(len(xy),dtype=bool)
+        cols=np.floor((xy[:,0]-self.gt[0])/self.gt[1]).astype(np.int64)
+        rows=np.floor((xy[:,1]-self.gt[3])/self.gt[5]).astype(np.int64)
+        inside=(cols>=0)&(rows>=0)&(cols<self.ds.RasterXSize)&(rows<self.ds.RasterYSize)
+        indices=np.flatnonzero(inside)
+        # Bucket by native tiles: bounded reads, even for a long diagonal line.
+        buckets={}
+        for i in indices:buckets.setdefault((int(cols[i]//256),int(rows[i]//256)),[]).append(i)
+        band=self.ds.GetRasterBand(self.ds.RasterCount)
+        for (bx,by),idx in buckets.items():
+            x0,y0=bx*256,by*256
+            data=band.ReadAsArray(x0,y0,min(256,self.ds.RasterXSize-x0),min(256,self.ds.RasterYSize-y0))
+            result[idx]=data[rows[idx]-y0,cols[idx]-x0]>0
+        return result
+
     def states(self, centres, normals, spacing, feedback):
         # A narrow cross section tolerates small lateral errors without borrowing
         # vegetation from adjacent rows. No longitudinal maximum filter is used.
@@ -225,11 +252,15 @@ class GapRasterSampler:
             coordinates=[rows-y0,cols-x0]
             def read(band, order=1):
                 data=band.ReadAsArray(x0,y0,x1-x0,y1-y0)
-                return ndi.map_coordinates(data.astype(float),coordinates,order=order,mode='constant',cval=np.nan)
-            alpha=read(self.ds.GetRasterBand(self.ds.RasterCount))
-            valid=np.isfinite(alpha) & (alpha>0)
+                return ndi.map_coordinates(data.astype(float),coordinates,order=order,mode='nearest')
+            alpha=read(self.ds.GetRasterBand(self.ds.RasterCount),order=0)
+            valid=(np.isfinite(alpha) & (alpha>0) & (cols>=-.5) & (rows>=-.5)
+                   & (cols<self.ds.RasterXSize-.5) & (rows<self.ds.RasterYSize-.5))
             if self.rgb:
-                r,g,b=[read(self.ds.GetRasterBand(i)) for i in self.rgb_bands]
+                # Keep native observations for metric boundaries. Bilinear
+                # mixing followed by weak-colour growth can expand a canopy
+                # into bare pixels and erase a minimum-size gap.
+                r,g,b=[read(self.ds.GetRasterBand(i),order=0) for i in self.rgb_bands]
                 states[start:stop] = classify_cross_sections(r,g,b,valid,offsets,spacing,along_step)[selection]
                 continue
             else:

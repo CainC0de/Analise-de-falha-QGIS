@@ -11,6 +11,7 @@ from scipy.signal import fftconvolve
 from scipy.spatial import cKDTree
 from .cane_centers import detect_stool_centers, fit_center_offsets, row_context_support
 from .planting_gaps import GapRasterSampler, intervals_from_states, sample_polyline, segment_coordinates, review_intervals
+from .row_network import clip_native, complete_network, register_empty_rows
 from qgis.PyQt.QtCore import QVariant
 from qgis.core import (
     QgsCoordinateTransform,
@@ -306,6 +307,33 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                     min_run=min_crop_run, raster_source=raster.source(), dst_wkt=crs.toWkt(),
                     raw_parts_override=detected_parts
                 )
+                # Infer from refined, supported observations, not the coarse
+                # tracer: otherwise its curvature bias propagates into gaps.
+                observed=polylines
+                refined=[np.array([(p.x(),p.y()) for p in item[0]]) for item in observed]
+                with tempfile.TemporaryDirectory(prefix='cane_row_network_') as directory:
+                    sampler=GapRasterSampler(raster.source(),crs.toWkt(),directory)
+                    try:
+                        completed,origins=complete_network(refined,spacing,sampler,feedback,
+                            max_extension=min(max_gap,3*spacing),support=self._row_observation_support)
+                        completed,owners=clip_native(completed,sampler,feedback)
+                    finally:sampler.close()
+                polylines=[];self._line_provenance=[]
+                for xy,owner in zip(completed,owners):
+                    length=float(np.linalg.norm(np.diff(xy,axis=0),axis=1).sum())
+                    angle=math.degrees(math.atan2(*(xy[-1]-xy[0])[::-1]))%180
+                    pct,pct_proj=0.,100.
+                    if owner<len(observed):
+                        source_xy=np.array([(p.x(),p.y()) for p in observed[owner][0]])
+                        distance,index=cKDTree(source_xy).query(xy)
+                        trusted=(distance<=.25)&self._row_observation_support[owner][index]
+                        segment_lengths=np.linalg.norm(np.diff(xy,axis=0),axis=1)
+                        pct=100*float(segment_lengths[trusted[:-1]&trusted[1:]].sum())/length
+                        pct_proj=100*float(segment_lengths[~trusted[:-1]&~trusted[1:]].sum())/length
+                    polylines.append(([QgsPointXY(float(x),float(y)) for x,y in xy],angle,length,0.,0.,0,pct,pct_proj))
+                    self._line_provenance.append(origins[owner])
+                feedback.pushInfo(f'Fileiras interiores inferidas por vizinhas regulares: '
+                    f'{origins.count("inferida_entre_vizinhas")}.')
             del raster_density, green_contrast, valid_field_mask
 
         if feedback.isCanceled():
@@ -345,6 +373,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         fields.append(QgsField('sem_dados_m', QVariant.Double, len=14, prec=2))
         fields.append(QgsField('amostra_cm', QVariant.Double, len=10, prec=2))
         fields.append(QgsField('incerto_m', QVariant.Double, len=14, prec=2))
+        fields.append(QgsField('origem', QVariant.String, len=24))
 
         sink, destination = self.parameterAsSink(
             parameters, self.OUTPUT, context, fields,
@@ -388,6 +417,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                 round(float(item[8]), 2),
                 round(float(item[9]), 2),
                 round(float(item[10]), 2),
+                getattr(self,'_line_provenance',[])[idx] if idx<len(getattr(self,'_line_provenance',[])) else 'observada',
             ])
             line_batch.append(feat)
             if len(line_batch) >= 2000:
@@ -825,9 +855,25 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         visited = np.zeros((h, w), dtype=bool)
         suppress_rad_px = max(1, int(round(0.38 * spacing / grid_res)))
 
-        seed_mask = np.zeros((h, w), dtype=bool)
-        seed_mask[::3, ::3] = True
-        seed_ys, seed_xs = np.nonzero(is_ridge & seed_mask)
+        # Pick maxima ON the ridges rather than intersecting them with a fixed
+        # 3-pixel lattice. A whole horizontal/vertical ridge can lie between
+        # lattice rows/columns and would then have no seed at all.
+        # Work in strips with a one-pixel halo to avoid two extra full-size
+        # float grids on large orthomosaics. The result equals full-grid NMS.
+        seed_rows, seed_cols = [], []
+        for y0_seed in range(0, h, 512):
+            if feedback.isCanceled():
+                return [], []
+            y1_seed = min(h, y0_seed + 512)
+            top, bottom = max(0, y0_seed - 1), min(h, y1_seed + 1)
+            values = np.where(is_ridge[top:bottom], resp[top:bottom], -np.inf)
+            maxima = ndi.maximum_filter(values, size=3, mode='constant', cval=-np.inf)
+            local = slice(y0_seed - top, y1_seed - top)
+            yy, xx = np.nonzero(is_ridge[y0_seed:y1_seed] & (values[local] == maxima[local]))
+            seed_rows.append(yy + y0_seed)
+            seed_cols.append(xx)
+        seed_ys = np.concatenate(seed_rows)
+        seed_xs = np.concatenate(seed_cols)
         order = np.argsort(resp[seed_ys, seed_xs])[::-1]
 
         step_march_m = 0.60
@@ -1111,7 +1157,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             density, raster_density, green_contrast, valid_field_mask,
             grid_res, spacing, xmin, ymax, gw, gh, feedback,
             max_offset=0.70, min_run=3.0, decay_len=2.0,
-            raster_source=None, dst_wkt=None, raw_parts_override=None):
+            raster_source=None, dst_wkt=None, raw_parts_override=None, raw_origins=None):
         raw_parts = raw_parts_override if raw_parts_override is not None else self._extract_planned_polylines(
             planned_layer, planned_transform, image_extent, feedback
         )
@@ -1119,6 +1165,16 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(
                 'Nenhuma linha projetada válida foi encontrada dentro da extensão da imagem.'
             )
+        reference_parts=raw_parts
+        provenance=raw_origins or ['projeto' if raw_parts_override is None else 'observada']*len(raw_parts)
+        if raster_source and dst_wkt:
+            with tempfile.TemporaryDirectory(prefix='cane_native_footprint_') as directory:
+                sampler=GapRasterSampler(raster_source,dst_wkt,directory)
+                try:raw_parts,owners=clip_native(raw_parts,sampler,feedback)
+                finally:sampler.close()
+            provenance=[provenance[i] for i in owners]
+        self._line_provenance=[]
+        self._row_observation_support=[]
 
         # Build continuous crop-center signal combining point cloud, RGB row mask, and local green contrast
         base_veg = density.copy()
@@ -1153,7 +1209,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         gap_segments = []
         total_parts = len(raw_parts)
         sampled = [self._resample_and_smooth_planned_line(
-                       part, step_m=step_s, preserve_geometry=raw_parts_override is None)
+                       part, step_m=step_s, preserve_geometry=True)
                    for part in raw_parts]
         valid_parts = [i for i, item in enumerate(sampled) if item[0] is not None]
         centers_by_part = {}
@@ -1197,7 +1253,8 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             rows0 = np.floor((ymax - p_xy[:, 1]) / grid_res).astype(np.int32)
             in_bounds = (cols0 >= 0) & (cols0 < gw) & (rows0 >= 0) & (rows0 < gh)
             in_valid = np.zeros(len(s_grid), dtype=bool)
-            in_valid[in_bounds] = valid_eroded[rows0[in_bounds], cols0[in_bounds]]
+            in_valid[in_bounds] = (True if raster_source and dst_wkt else
+                valid_eroded[rows0[in_bounds], cols0[in_bounds]])
 
             valid_idx = np.flatnonzero(in_valid)
             if valid_idx.size < 4:
@@ -1303,7 +1360,12 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                 polylines.append(
                     (pts_xy, angle_deg, length_m, gap_m_total, gap_pct, n_gaps, pct_pe, pct_projected)
                 )
+                self._line_provenance.append(provenance[p_idx])
+                self._row_observation_support.append(from_plant)
 
+        if raw_parts_override is None and polylines:
+            polylines,self._line_provenance=register_empty_rows(
+                polylines,reference_parts,self._line_provenance,spacing)
         if polylines:
             locked_m = sum(item[2] * item[7] / 100.0 for item in polylines)
             feedback.pushInfo(
@@ -1518,6 +1580,11 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             'Manchas isoladas entre falhas e trechos sem continuidade confiável não '
             'deslocam a referência; o percentual protegido aparece em pct_proj. '
             'Essa proteção não identifica botanicamente plantas invasoras.\n\n'
+            'O campo origem distingue projeto, projeto_registrado, observada e '
+            'inferida_entre_vizinhas. Fileiras vazias só são inferidas entre vizinhas '
+            'paralelas com espaçamento regular e sobreposição suficiente; não são '
+            'criadas além das fileiras externas. Referências sem apoio próprio podem '
+            'receber registro comum confirmado por pelo menos três fileiras com cultura.\n\n'
             'Como funciona:\n'
             '1. Combina a nuvem de pontos da cultura com o contraste local da '
             'imagem de referência em uma grade métrica de alta resolução.\n'
