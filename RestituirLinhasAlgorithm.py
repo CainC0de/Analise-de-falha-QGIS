@@ -326,6 +326,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         fields.append(QgsField('pct_proj', QVariant.Double, len=10, prec=2))
         fields.append(QgsField('sem_dados_m', QVariant.Double, len=14, prec=2))
         fields.append(QgsField('amostra_cm', QVariant.Double, len=10, prec=2))
+        fields.append(QgsField('incerto_m', QVariant.Double, len=14, prec=2))
 
         sink, destination = self.parameterAsSink(
             parameters, self.OUTPUT, context, fields,
@@ -354,7 +355,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             pct_proj = float(item[7]) if len(item) > 7 else 0.0
             total_length_m += length_m
             total_gap_m += gap_m
-            total_known_m += max(0., length_m-float(item[8]))
+            total_known_m += max(0., length_m-float(item[8])-float(item[10]))
             feat = QgsFeature(fields)
             feat.setGeometry(QgsGeometry.fromPolylineXY(pts_xy))
             feat.setAttributes([
@@ -368,6 +369,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                 round(pct_proj, 2),
                 round(float(item[8]), 2),
                 round(float(item[9]), 2),
+                round(float(item[10]), 2),
             ])
             line_batch.append(feat)
             if len(line_batch) >= 2000:
@@ -401,7 +403,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             f'({total_length_m:.1f} m totais). '
             f'Falhas detectadas: {len(gap_segments)} trecho(s) somando {total_gap_m:.1f} m '
             f'({overall_gap_pct:.1f}% do comprimento avaliado; '
-            f'{total_length_m-total_known_m:.1f} m sem dados).'
+            f'{total_length_m-total_known_m:.1f} m sem dados ou incertos).'
         )
         result = {self.OUTPUT: destination}
         if gap_destination is not None:
@@ -1043,13 +1045,16 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                     edges, centres, normals = sample_polyline(xy, step)
                     states = sampler.states(centres, normals, spacing, feedback)
                     intervals, unknown = intervals_from_states(
-                        edges, states, minimum, min_crop_m=max(2*sampler.res, 0.10))
+                        edges, states, minimum, min_crop_m=0.0)
                     total = sum(b-a for a,b,category in intervals)
                     base = list(item[:8]) if len(item) >= 8 else list(item[:6]) + [100., 0.]
                     base[3] = total
                     base[4] = 100. * total / max(1e-9, edges[-1]-unknown)
                     base[5] = len(intervals)
-                    measured.append(tuple(base) + (unknown, (edges[1]-edges[0])*100))
+                    lengths = np.diff(edges)
+                    nodata = float(lengths[states == -1].sum())
+                    uncertain = float(lengths[states == -2].sum())
+                    measured.append(tuple(base) + (nodata, (edges[1]-edges[0])*100, uncertain))
                     for a,b,category in intervals:
                         coords = segment_coordinates(xy,a,b)
                         points = [QgsPointXY(float(x),float(y)) for x,y in coords]

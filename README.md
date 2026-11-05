@@ -125,10 +125,12 @@ Em vez de assumir um único ângulo global reto para toda a propriedade, o algor
 
 - **Tamanho mínimo para identificação como falha (cm)**: padrão **50 cm**; por exemplo, 100 considera somente trechos com pelo menos 1 m. O valor não altera a restituição nem o parâmetro de interpolação longitudinal.
 - A amostragem acompanha a distância ao longo das curvas, com passo de até 5 cm quando a resolução permite. Não se inventa resolução: pixels mais grosseiros limitam o detalhe, e mínimos inferiores a dois pixels geram aviso.
-- O perfil transversal usa até 20 cm de cada lado do eixo, limitado pelo espaçamento entre fileiras. Respostas verdes isoladas menores que o maior valor entre 10 cm e dois pixels, cercadas por ausência, não fragmentam uma falha. Isso reduz ruído, sem constituir identificação botânica de invasoras.
+- O perfil transversal avalia a faixa da fileira até 35 cm de cada lado do eixo, limitada a 28% do espaçamento. Amostras externas, ainda dentro de meia entrelinha, estimam a cor local do solo. A comparação de cromaticidade com esse fundo permite reconhecer cana oliva/amarelada sem exigir que o verde seja maior que o vermelho.
+- Duas amostras transversais adjacentes com evidência vegetal podem confirmar presença em qualquer posição da faixa; a planta não precisa cair exatamente no eixo. Evidência fraca, sombra ou falta de fundo comparável é marcada como **incerta**, em vez de ser convertida diretamente em ausência.
+- Presença confirmada, mesmo em um trecho longitudinal curto, interrompe a falha. A medição final não apaga plantas com um filtro de comprimento nem junta ausências através de plantas ou regiões incertas. A detecção geométrica de fileiras e sua proteção contra manchas isoladas continuam independentes dessa medição.
 - Os limites são medidos pelas bordas das células de amostragem. Os segmentos não incorporam o vértice vizinho com cultura, evitando o alongamento artificial da medição antiga.
-- Categorias: **interna**, **inicial**, **final**, **total** e **limite_dados** (adjacente a NoData). Falhas junto a dados ausentes podem continuar além da área observada.
-- NoData/transparência é registrado como **sem dados**, não como solo exposto. O percentual de falha usa somente o comprimento avaliado; linhas inteiramente sem dados têm percentual zero acompanhado de `sem_dados_m` igual ao comprimento total.
+- Categorias: **interna**, **inicial**, **final**, **total**, **limite_dados** (adjacente a NoData) e **limite_incerto** (adjacente a evidência ambígua). Falhas limitadas por regiões não avaliadas podem continuar além do trecho confirmado.
+- NoData/transparência é registrado em `sem_dados_m` e ambiguidade em `incerto_m`. Ambos são excluídos do denominador de `falha_pct`. Percentual zero com grande comprimento incerto não significa comprovação de plantio completo; esses trechos exigem revisão.
 
 O RGB indica cobertura vegetal visível, não a existência de colmos sob folhas sobrepostas. Dossel fechado e invasoras podem ocultar falhas. A escolha de uma época com menor fechamento de dossel e a conferência com medições de campo continuam necessárias. A regra de 50 cm é um padrão histórico, e o usuário pode alterá-la.
 
@@ -150,6 +152,7 @@ Bases consultadas: [Maldaner et al., 2021 — comparação de sensores para medi
      - `falha_pct`: Percentual de falha sobre o comprimento com dados (`0–100%`).
      - `num_falhas`: Quantidade de trechos que atingem o mínimo configurado.
      - `sem_dados_m`: Comprimento não avaliado por falta de imagem válida.
+     - `incerto_m`: Comprimento com evidência ambígua, excluído da contagem de falhas confirmadas.
      - `amostra_cm`: Passo efetivo de amostragem, em centímetros.
      - `pct_pes`: Percentual do comprimento com apoio aceito para centralização.
      - `pct_proj`: Percentual do comprimento protegido e mantido na referência por falta de apoio confiável.

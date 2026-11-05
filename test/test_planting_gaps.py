@@ -30,12 +30,52 @@ class GapTests(unittest.TestCase):
         self.assertEqual([v[2] for v in found],['inicial','final'])
 
     def test_isolated_green_speck_does_not_split_gap(self):
-        found,_=gaps.intervals_from_states(np.arange(22)*.05,[0]*10+[1]+[0]*10,.5)
+        found,_=gaps.intervals_from_states(np.arange(22)*.05,[0]*10+[1]+[0]*10,.5,min_crop_m=.10)
         self.assertEqual(len(found),1); self.assertAlmostEqual(found[0][1],1.05)
 
     def test_true_crop_stand_separates_gaps(self):
         found,_=gaps.intervals_from_states(np.arange(25)*.05,[0]*10+[1]*4+[0]*10,.5)
         self.assertEqual(len(found),2)
+
+    def test_short_confirmed_plant_always_interrupts_a_150cm_gap(self):
+        found,_=gaps.intervals_from_states(np.arange(42)*.05,[0]*20+[1]+[0]*20,1.5)
+        self.assertFalse(found)
+
+    def test_olive_cane_from_reported_image_is_not_bare_soil(self):
+        offsets=np.linspace(-.675,.675,45)
+        rgb=np.tile(np.array([168.,152.,125.]),(4,45,1))
+        # Actual RGB colours from the reported image (G < R).
+        for i,colour in enumerate(([110,101,73],[114,106,78],[140,133,104],[143,141,107])):
+            rgb[i,np.abs(offsets)<.12]=colour
+        states=gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],
+            np.ones((4,45),bool),offsets,1.5)
+        np.testing.assert_array_equal(states,1)
+
+    def test_off_axis_cane_is_not_rejected_by_central_sample_requirement(self):
+        offsets=np.linspace(-.675,.675,45)
+        rgb=np.tile(np.array([168.,152.,125.]),(1,45,1))
+        rgb[0,np.abs(offsets-.27)<.07]=[110,101,73]
+        states=gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],
+            np.ones((1,45),bool),offsets,1.5)
+        self.assertEqual(states[0],1)
+
+    def test_shadow_is_uncertain_and_does_not_join_two_absences(self):
+        offsets=np.linspace(-.675,.675,45)
+        rgb=np.tile(np.array([168.,152.,125.]),(1,45,1))
+        rgb[0,np.abs(offsets)<.2]*=.4
+        state=gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],
+            np.ones((1,45),bool),offsets,1.5)[0]
+        self.assertEqual(state,-2)
+        found,unassessed=gaps.intervals_from_states(np.arange(42)*.05,[0]*20+[-2]+[0]*20,1.5)
+        self.assertFalse(found)
+        self.assertAlmostEqual(unassessed,.05)
+
+    def test_uniform_bare_soil_still_produces_a_gap(self):
+        offsets=np.linspace(-.675,.675,45)
+        rgb=np.tile(np.array([168.,152.,125.]),(1,45,1))
+        state=gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],
+            np.ones((1,45),bool),offsets,1.5)[0]
+        self.assertEqual(state,0)
 
     def test_curve_lengths_are_along_polyline_not_chord(self):
         xy=np.array([[0,0],[1,0],[1,1]],float)
@@ -113,6 +153,7 @@ class GapTests(unittest.TestCase):
             segments=QgsProcessingUtils.mapLayerFromString(result['OUTPUT_GAPS'],ctx)
             self.assertEqual(rows.featureCount(),1)
             self.assertIn('sem_dados_m',rows.fields().names())
+            self.assertIn('incerto_m',rows.fields().names())
             self.assertIn('categoria',segments.fields().names())
             self.assertTrue(all(f['compr_m']+1e-6>=minimum/100 for f in segments.getFeatures()))
             outputs.append((bytes(next(rows.getFeatures()).geometry().asWkb()),segments.featureCount()))

@@ -1,6 +1,6 @@
 """Planting-gap measurement independent of line reconstruction.
 
-State 1 is visible green vegetation, 0 absence, -1 unavailable imagery.
+State 1 is vegetation, 0 supported absence, -1 unavailable, -2 ambiguous.
 These observations cannot certify stalk presence beneath a closed canopy.
 """
 import math
@@ -9,7 +9,7 @@ import numpy as np
 import scipy.ndimage as ndi
 
 
-def intervals_from_states(edges, states, minimum_m, min_crop_m=0.10):
+def intervals_from_states(edges, states, minimum_m, min_crop_m=0.0):
     """Measure absent intervals by cell edges, never by neighbouring crop vertices."""
     edges = np.asarray(edges, dtype=float)
     states = np.asarray(states, dtype=np.int8).copy()
@@ -34,9 +34,48 @@ def intervals_from_states(edges, states, minimum_m, min_crop_m=0.10):
         kind = 'total' if a == 0 and b == len(states) else ('inicial' if a == 0 else 'final' if b == len(states) else 'interna')
         if (a > 0 and states[a-1] == -1) or (b < len(states) and states[b] == -1):
             kind = 'limite_dados'
+        elif (a > 0 and states[a-1] == -2) or (b < len(states) and states[b] == -2):
+            kind = 'limite_incerto'
         gaps.append((float(edges[a]), float(edges[b]), kind))
-    unknown = float(np.diff(edges)[states == -1].sum())
+    unknown = float(np.diff(edges)[states < 0].sum())
     return gaps, unknown
+
+
+def classify_cross_sections(r, g, b, valid, offsets, spacing):
+    """Compare canopy chromaticity with local inter-row background, not G>=R.
+
+    Darkness or weak plant evidence is ambiguity, never proof of bare soil.
+    Longitudinal observations are not dilated or filled over detected plants.
+    """
+    offsets = np.asarray(offsets)
+    inner = np.abs(offsets) <= min(0.35, 0.28 * spacing)
+    flank = np.abs(offsets) >= 0.35 * spacing
+    total = r + g + b + 1e-9
+    exg = (2*g-r-b)/total
+    ngrdi = (g-r)/(g+r+1e-9)
+    valid = valid & np.isfinite(total)
+    def background(values):
+        data = np.where(valid[:,flank], values[:,flank], np.nan)
+        # Avoid all-NaN median warnings while retaining missing-background flags.
+        data = np.ma.masked_invalid(data)
+        med = np.ma.median(data,axis=1).filled(np.nan)
+        return med[:,None]
+    bg_exg, bg_ngrdi, bg_light = [background(v) for v in (exg,ngrdi,total)]
+    de, dn = exg-bg_exg, ngrdi-bg_ngrdi
+    absolute = (exg > 0.07) & (ngrdi > 0.005) & (g > b)
+    relative = (de > 0.025) & (dn > 0.004) & (g > 1.04*b)
+    green = (absolute | relative) & valid
+    evidence = green[:,inner]
+    # Adjacent samples ensure a coherent canopy cross-section, anywhere in the
+    # row corridor (not only at the exact line axis).
+    crop = (evidence[:,:-1] & evidence[:,1:]).any(axis=1)
+    weak = ((de > 0.012) & (dn > 0) & (g>b)) | absolute
+    dark = total < 0.65*bg_light
+    unsure = ((weak | dark) & valid)[:,inner].any(axis=1)
+    known = valid[:,inner].sum(axis=1) >= max(2,int(np.ceil(inner.sum()*0.75)))
+    background_known = valid[:,flank].sum(axis=1) >= 2
+    return np.where(~known,-1,np.where(crop,1,np.where(
+        unsure | ~background_known,-2,0))).astype(np.int8)
 
 
 def sample_polyline(xy, step):
@@ -89,8 +128,8 @@ class GapRasterSampler:
     def states(self, centres, normals, spacing, feedback):
         # A narrow cross section tolerates small lateral errors without borrowing
         # vegetation from adjacent rows. No longitudinal maximum filter is used.
-        half = min(0.20, 0.18 * spacing)
-        offsets = np.linspace(-half, half, 7)
+        half = 0.45 * spacing
+        offsets = np.linspace(-half, half, max(15,int(math.ceil(2*half/self.res)) | 1))
         states = np.full(len(centres), -1, dtype=np.int8)
         for start in range(0, len(centres), 256):
             if feedback.isCanceled():
@@ -112,18 +151,16 @@ class GapRasterSampler:
             valid=np.isfinite(alpha) & (alpha>0)
             if self.rgb:
                 r,g,b=[read(self.ds.GetRasterBand(i)) for i in (1,2,3)]
-                gli=(2*g-r-b)/(2*g+r+b+1e-6)
-                ngrdi=(g-r)/(g+r+1e-6)
-                green=(gli>0.035)&(ngrdi>-.025)&(g>b)&(g>=.97*r)
-                valid &= np.isfinite(r+g+b)
+                states[start:stop] = classify_cross_sections(r,g,b,valid,offsets,spacing)
+                continue
             else:
                 values=read(self.ds.GetRasterBand(1),order=0)
                 valid &= np.isin(values,[0,1])
                 green=values==1
-            known=valid.sum(axis=1)>=5
-            # Two independent cross-section samples, including a central sample,
-            # reject isolated lateral leaves/speckles in the search corridor.
-            crop=((green & valid).sum(axis=1)>=2) & (green[:,2:5]&valid[:,2:5]).any(axis=1)
+            inner=np.abs(offsets)<=min(.35,.28*spacing)
+            known=valid[:,inner].sum(axis=1)>=max(2,int(np.ceil(inner.sum()*.75)))
+            evidence=(green & valid)[:,inner]
+            crop=evidence.any(axis=1)
             states[start:stop]=np.where(known,np.where(crop,1,0),-1)
         return states
 
