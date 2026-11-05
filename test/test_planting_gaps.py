@@ -53,11 +53,65 @@ class GapTests(unittest.TestCase):
 
     def test_off_axis_cane_is_not_rejected_by_central_sample_requirement(self):
         offsets=np.linspace(-.675,.675,45)
-        rgb=np.tile(np.array([168.,152.,125.]),(1,45,1))
-        rgb[0,np.abs(offsets-.27)<.07]=[110,101,73]
+        rgb=np.tile(np.array([168.,152.,125.]),(4,45,1))
+        rgb[:,np.abs(offsets-.27)<.07]=[110,101,73]
         states=gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],
-            np.ones((1,45),bool),offsets,1.5)
-        self.assertEqual(states[0],1)
+            np.ones((4,45),bool),offsets,1.5)
+        np.testing.assert_array_equal(states,1)
+
+    def test_straw_speckles_cannot_fragment_a_150cm_empty_row(self):
+        offsets=np.linspace(-.675,.675,45)
+        rgb=np.tile(np.array([168.,152.,125.]),(60,45,1))
+        for i in range(2,60,6):
+            rgb[i,20:22]=[155,149,115]  # Weak local colour, not a plant object.
+        states=gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],
+            np.ones((60,45),bool),offsets,1.5)
+        found,_=gaps.intervals_from_states(np.arange(61)*.05,states,1.5)
+        self.assertEqual(len(found),1)
+        self.assertAlmostEqual(found[0][1]-found[0][0],3.)
+
+    def test_one_plant_cannot_flood_a_connected_straw_carpet(self):
+        offsets=np.linspace(-.675,.675,45)
+        rgb=np.tile(np.array([185.,115.,75.]),(100,45,1))
+        rgb[:,np.abs(offsets)<.3]=[165,150,120]  # Straw brighter than red soil.
+        rgb[45:55,np.abs(offsets)<.15]=[45,125,30]
+        states=gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],
+            np.ones((100,45),bool),offsets,1.5)
+        self.assertTrue((states[:30]==0).all())
+        self.assertTrue((states[70:]==0).all())
+        self.assertTrue((states[45:55]==1).all())
+        found,_=gaps.intervals_from_states(np.arange(101)*.05,states,1.5)
+        self.assertEqual(len(found),2)
+
+    def test_dense_vegetation_filter_does_not_remove_image_coverage(self):
+        import ast
+        import scipy.ndimage as ndi
+        tree=ast.parse((ROOT/'RestituirLinhasAlgorithm.py').read_text(encoding='utf-8'))
+        cls=next(n for n in tree.body if isinstance(n,ast.ClassDef))
+        method=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='_classify_rgb_grid')
+        scope={'np':np,'ndi':ndi}
+        exec(compile(ast.Module(body=[method],type_ignores=[]),'<coverage>','exec'),scope)
+        shape=(100,100);valid=np.ones(shape,bool);valid[:2]=False
+        crop,contrast,coverage=scope[method.name](None,np.full(shape,40),np.full(shape,150),np.full(shape,30),valid,.15)
+        self.assertFalse(crop.any())  # Dense-canopy exclusion remains separate.
+        np.testing.assert_array_equal(coverage,valid)
+
+    def test_planned_line_survives_dense_patch_excluded_from_crop_signal(self):
+        import sys,types,importlib,uuid
+        from qgis.core import (QgsVectorLayer,QgsFeature,QgsGeometry,QgsPointXY,
+                              QgsRectangle,QgsProcessingFeedback)
+        pkg=types.ModuleType('dense_patch_test_'+uuid.uuid4().hex);pkg.__path__=[str(ROOT)];sys.modules[pkg.__name__]=pkg
+        module=importlib.import_module(pkg.__name__+'.RestituirLinhasAlgorithm')
+        alg=module.RestituirLinhasAlgorithm()
+        shape=(60,120);valid=np.ones(shape,bool)
+        density,contrast,coverage=alg._classify_rgb_grid(np.full(shape,40),np.full(shape,150),np.full(shape,30),valid,.1)
+        planned=QgsVectorLayer('LineString?crs=EPSG:31982','planned','memory')
+        f=QgsFeature();f.setGeometry(QgsGeometry.fromPolylineXY([QgsPointXY(600000.5,8089998),QgsPointXY(600009.5,8089998)]))
+        planned.dataProvider().addFeatures([f]);planned.updateExtents()
+        lines,_=alg._reconstruct_from_planned_lines(planned,None,QgsRectangle(600000,8089994,600012,8090000),
+            density,density,contrast,coverage,.1,1.5,600000,8090000,120,60,QgsProcessingFeedback())
+        self.assertEqual(len(lines),1)
+        self.assertAlmostEqual(lines[0][2],9.,places=5)
 
     def test_shadow_is_uncertain_and_does_not_join_two_absences(self):
         offsets=np.linspace(-.675,.675,45)

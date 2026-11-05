@@ -559,7 +559,9 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         valid_field = valid & (~forest_buffer)
         crop_grid = (is_row_veg & valid_field).astype(np.float32)
         green_contrast = np.where(valid_field, np.maximum(0.0, local_contrast), 0.0).astype(np.float32)
-        return crop_grid, green_contrast, valid_field
+        # Vegetation rejection is NOT a data-footprint mask. In particular,
+        # dense cane/weed patches must not punch holes in planned row geometry.
+        return crop_grid, green_contrast, valid
 
     def _fuse_point_and_raster_density(
             self, point_density, raster_density, grid_res, spacing, feedback):
@@ -1105,7 +1107,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         row_signal = crop_smooth - ndi.uniform_filter(crop_smooth, size=bg_win)
 
         if valid_field_mask is not None:
-            valid_eroded = ndi.minimum_filter(valid_field_mask, size=max(3, int(round(0.45 / grid_res))))
+            valid_eroded = valid_field_mask
         else:
             valid_eroded = np.ones((gh, gw), dtype=bool)
 
