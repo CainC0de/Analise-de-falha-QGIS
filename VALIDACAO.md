@@ -2,6 +2,8 @@
 
 Data: 5 de novembro de 2026.
 
+**Atualização 2.5:** a bateria de regressão ampliada passou por **75 testes**, incluindo o fluxo completo de uma falha de 50 cm atravessada por folha lateral, preservação das geometrias e controles de plantas deslocadas. Método, reprodução e limites estão em [FALHAS_CURTAS.md](FALHAS_CURTAS.md). Os resultados históricos abaixo identificam suas respectivas revisões; não devem ser atribuídos automaticamente à 2.5.
+
 **Parecer: os nove cenários da bateria de aceitação foram aprovados após a reestruturação, com os mesmos critérios de geometria, correspondência, mínimo de 50 cm e erro de comprimento.**
 
 Base: commit `b215d7340e7956ab76fcd20a379a589fc156aa03` acrescido das alterações locais da revisão 2.4. O manifesto identifica os cinco módulos de produção por SHA-256. A instalação precisa conter os arquivos testados; a mesma versão nominal não identifica por si só a implementação.
@@ -84,3 +86,11 @@ Cada cenário grava RGB, verdade geométrica, GeoPackages e métricas JSON. O id
 **Aprovada a bateria funcional descrita, incluindo os casos anteriormente reprovados.** Não há comprovação independente para todas as variedades, estágios, iluminações ou invasoras. Cana amarelada foi verificada em ensaios de cor controlada; a semelhança visual com palhada e invasoras continua sujeita à incerteza do RGB. A geometria inferida depende da regularidade observada e do espaçamento informado.
 
 Este é um laudo de testes reproduzíveis produzido junto ao desenvolvimento. Não é certificação independente de organismo acreditado nem garantia de identificação perfeita em qualquer imagem.
+
+## Revisão posterior 2.4.1 — comparação com Inforow
+
+Uma nova execução e inspeção estratificada de divergências com o Inforow identificaram uma dependência de processamento que não estava coberta na bateria original. A largura típica de um objeto era calculada no bloco completo; variar o sentido de leitura podia mudar a classe das mesmas coordenadas. Nas 20 linhas reais sorteadas, quatro amostras (20 cm somados) mudaram de classe. Em um controle sintético com largura variável, 256 de 800 estações diferiam entre os sentidos.
+
+O cálculo passou a usar uma janela física local, com halo suficiente para largura, crescimento limitado e área de ambiguidade. O número de amostras transversais foi corrigido para manter passo igual ou menor ao pixel nativo. Após a correção, nenhuma das mesmas coordenadas das 20 linhas mudou de classe com a reversão. O novo controle sintético também passou.
+
+**A revisão passou por 69 testes de regressão e manteve aprovação nos nove cenários completos, com os critérios originais.** Isso verifica a correção reproduzida e preserva as propriedades anteriores. Concordância com outro programa e inspeção visual de uma amostra pequena continuam sem equivaler a acurácia de campo. As métricas e imagens da comparação são conservadas separadamente dos dados de teste sintéticos.

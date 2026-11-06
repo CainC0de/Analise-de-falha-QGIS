@@ -26,6 +26,7 @@ from qgis.core import (
     QgsProcessingAlgorithm,
     QgsProcessingException,
     QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterBoolean,
     QgsProcessingParameterNumber,
     QgsProcessingParameterRasterLayer,
     QgsProcessingParameterVectorLayer,
@@ -45,6 +46,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
     PLANNED_MAX_OFFSET = 'PLANNED_MAX_OFFSET'
     MIN_CROP_RUN = 'MIN_CROP_RUN'
     MIN_GAP_CM = 'MIN_GAP_CM'
+    REFINE_VISIBLE_GAPS = 'REFINE_VISIBLE_GAPS'
     OUTPUT = 'OUTPUT'
     OUTPUT_GAPS = 'OUTPUT_GAPS'
     OUTPUT_REVIEW = 'OUTPUT_REVIEW'
@@ -117,6 +119,9 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             self.MIN_GAP_CM, 'Tamanho mínimo para identificação como falha (cm)',
             type=QgsProcessingParameterNumber.Double, defaultValue=50.0, minValue=1.0,
         ))
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.REFINE_VISIBLE_GAPS,'Melhorar detecção de falhas curtas com solo visível (RGB)',
+            defaultValue=True))
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUTPUT,
             'Linhas de plantio restituídas',
@@ -202,6 +207,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         planned_max_offset = self.parameterAsDouble(parameters, self.PLANNED_MAX_OFFSET, context)
         min_crop_run = self.parameterAsDouble(parameters, self.MIN_CROP_RUN, context)
         self._min_gap_m = self.parameterAsDouble(parameters, self.MIN_GAP_CM, context) / 100.0
+        self._refine_visible_gaps=self.parameterAsBool(parameters,self.REFINE_VISIBLE_GAPS,context)
         if not np.isfinite(self._min_gap_m) or self._min_gap_m <= 0:
             raise QgsProcessingException('Informe um tamanho mínimo de falha positivo em centímetros.')
 
@@ -387,6 +393,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
         gap_fields.append(QgsField('linha_id', QVariant.Int))
         gap_fields.append(QgsField('compr_m', QVariant.Double, len=14, prec=2))
         gap_fields.append(QgsField('categoria', QVariant.String, len=20))
+        gap_fields.append(QgsField('evidencia', QVariant.String, len=24))
         gap_sink, gap_destination = self.parameterAsSink(
             parameters, self.OUTPUT_GAPS, context, gap_fields,
             QgsWkbTypes.LineString, crs,
@@ -433,7 +440,9 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             for g_idx, (line_id, g_pts, g_len, category) in enumerate(gap_segments):
                 g_feat = QgsFeature(gap_fields)
                 g_feat.setGeometry(QgsGeometry.fromPolylineXY(g_pts))
-                g_feat.setAttributes([g_idx + 1, int(line_id), round(float(g_len), 2), category])
+                evidence=getattr(self,'_gap_evidence',[])
+                g_feat.setAttributes([g_idx + 1, int(line_id), round(float(g_len), 2), category,
+                    evidence[g_idx] if g_idx<len(evidence) else 'ausencia_raster'])
                 gap_batch.append(g_feat)
                 gap_count += 1
                 if len(gap_batch) >= 5000:
@@ -1093,11 +1102,13 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
     def _remeasure_gaps(self, polylines, source, target_wkt, spacing, feedback, review_callback=None):
         """Final measurement uses original imagery, never the dilated tracing mask."""
         measured, gaps = [], []
+        self._gap_evidence=[]
         minimum = self._min_gap_m
         feedback.pushInfo(f'Medindo falhas no raster sem dilatação; mínimo: {minimum*100:g} cm...')
         with tempfile.TemporaryDirectory(prefix='cane_gap_measurement_') as directory:
             try:
-                sampler = GapRasterSampler(source, target_wkt, directory)
+                sampler = GapRasterSampler(source, target_wkt, directory,
+                    refine_visible=getattr(self,'_refine_visible_gaps',True))
             except (RuntimeError, ValueError) as exc:
                 raise QgsProcessingException(str(exc))
             try:
@@ -1132,6 +1143,9 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                         coords = segment_coordinates(xy,a,b)
                         points = [QgsPointXY(float(x),float(y)) for x,y in coords]
                         gaps.append((i+1, points, b-a, category))
+                        selected=(edges[:-1]<b)&(edges[1:]>a)
+                        self._gap_evidence.append('solo_e_nucleo' if sampler.last_refined[selected].any()
+                                                  else 'ausencia_raster')
                     feedback.setProgress(95.0 + 4.0*(i+1)/max(1,len(polylines)))
             finally:
                 sampler.close()
@@ -1603,6 +1617,12 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             '4. Mede a ausência de vegetação no raster original, em faixa estreita '
             'sem dilatação. O tamanho mínimo é configurado em centímetros '
             '(padrão: 50 cm). NoData não é considerado falha. '
+            'A opção "Melhorar detecção de falhas curtas com solo visível (RGB)" '
+            'combina solo visível no eixo e núcleos compactos das touceiras para '
+            'reduzir omissões causadas por folhas laterais. Exige resolução de '
+            'até 6 cm, conserva plantas deslocadas e não infere solo sob dossel '
+            'fechado. O campo evidencia registra solo_e_nucleo quando essa '
+            'análise contribui para o segmento; os demais usam ausencia_raster. '
             'Classifica trechos como internos, iniciais, finais, totais ou '
             'junto a dados ausentes, gravando os atributos compr_m, '
             'falha_m, falha_pct e num_falhas, além da camada vetorial de falhas.'

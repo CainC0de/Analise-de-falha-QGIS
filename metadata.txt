@@ -2,7 +2,7 @@
 name=Falha de Plantio
 qgisMinimumVersion=3.22
 description=Classifica cobertura verde em imagens RGB, gera GeoTIFF e nuvem de pontos da cultura e restitui linhas de plantio.
-version=2.4
+version=2.5
 author=CainC0de
 email=
 
@@ -14,6 +14,8 @@ repository=https://github.com/CainC0de/Analise-de-falha-QGIS
 hasProcessingProvider=yes
 
 changelog=
+    2.5 - Refinamento opcional de falhas curtas por solo visível e núcleos de touceiras no RGB; evidência por segmento e leitura de blocos nativos com cache limitado a 32 MiB
+    2.4.1 - Largura de cultura estimada em janela física local, halo proporcional à resolução e passo transversal limitado ao pixel nativo; correção de dependência da direção de leitura e nova comparação com Inforow
     2.4 - Medição por amostras nativas, recorte preciso pela cobertura do raster, registro de projetos deslocados e inferência limitada de fileiras interiores entre vizinhas regulares; origem geométrica explícita e bateria de aceitação reproduzível
     2.3 - Classificação adaptativa GLI+NGRDI (elimina falso-positivo em palhada e sombras), leitura rápida via VRT sem arquivos temporários gigantes, restituição 2D via FFT local + filtro direcional para curvas de nível/terraços e camada de falhas detectadas
     2.2 - Restituição adaptativa de linhas de plantio a partir da nuvem de pontos

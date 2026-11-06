@@ -1,4 +1,4 @@
-# Falha de Plantio para QGIS (v2.3)
+# Falha de Plantio para QGIS (v2.5)
 
 Plugin para o QGIS voltado à **análise automatizada de falhas de plantio na cultura de cana-de-açúcar** a partir de ortomosaicos RGB de drones/VANTs.
 
@@ -51,7 +51,7 @@ Para resolver esse problema de forma robusta, o algoritmo combina:
 3. **Supressão Automática de Mata/APP e Bordas Transparentes**:
    - Reconhece automaticamente a banda `Alpha` (ou pixels de borda `(0,0,0)`) como `NoData (255)`.
    - Na geração da **nuvem de pontos da cultura**, filtra manchas extensas e contínuas de dossel arbóreo (mata nativa / APP) e estradas/carreadores, concentrando os pontos exclusivamente sobre as fileiras de plantio.
-   - **Detecção Completa de Touceiras**: além do contraste local, detecta vegetação densa ou sombreada conectada ao núcleo verde da fileira, garantindo que mesmo touceiras com menor contraste radiométrico gerem pontos (cobertura de 99,2% da cana real nos testes de validação).
+   - Além do contraste local, considera vegetação densa ou sombreada conectada ao núcleo verde da fileira para ampliar o apoio a touceiras com menor contraste radiométrico. O desempenho depende da imagem e exige validação no talhão.
 4. **Processamento em Blocos via VRT Dinâmico**:
    - A leitura e eventual reprojeção para UTM ocorrem sob demanda em memória via `GDAL VRT`, sem gravar arquivos temporários gigantescos em disco e mantendo a resolução espacial efetiva da imagem.
 
@@ -124,14 +124,17 @@ Em vez de assumir um único ângulo global reto para toda a propriedade, o algor
 ### Medição e categorização das falhas
 
 - **Tamanho mínimo para identificação como falha (cm)**: padrão **50 cm**; por exemplo, 100 considera somente trechos com pelo menos 1 m. O valor não altera a restituição nem o parâmetro de interpolação longitudinal.
+- **Melhorar detecção de falhas curtas com solo visível (RGB)**: ativado por padrão. Combina solo visível na faixa central com núcleos compactos das touceiras para reconhecer intervalos ocultados apenas por folhas laterais. Usa o RGB original com passo longitudinal e transversal de até 6 cm. Em máscara binária ou resolução mais grosseira, mantém a medição anterior. A opção não altera o mínimo nem o traçado.
+- O refinamento exige pelo menos 90% de dados válidos e 80% de solo reconhecido na faixa central de até 10 cm para cada lado. Núcleos vegetais compactos no corredor, mesmo deslocados, vetam a recuperação. Somente intervalos limitados por núcleos próximos nas duas extremidades e com até o menor valor entre 3 m e duas entrelinhas são reconsiderados. São regras verificáveis desta implementação; solo coberto por folhas não é inferido.
 - A amostragem acompanha a distância ao longo das curvas, com passo de até 5 cm quando a resolução permite. Não se inventa resolução: pixels mais grosseiros limitam o detalhe, e mínimos inferiores a dois pixels geram aviso.
 - O perfil transversal avalia a faixa da fileira até 35 cm de cada lado do eixo, limitada a 28% do espaçamento. Amostras externas, ainda dentro de meia entrelinha, estimam a cor local do solo. A comparação de cromaticidade com esse fundo permite reconhecer cana oliva/amarelada sem exigir que o verde seja maior que o vermelho.
 - Os intervalos usam passos completos (por exemplo, 5 cm), deixando somente a última célula com o restante do comprimento. Isso evita descartar uma falha no limite de 50 cm porque a divisão uniforme da linha produziu dez células ligeiramente menores que 5 cm.
 - O apoio transversal de cada objeto confirma presença em qualquer posição da faixa; a planta não precisa cair exatamente no eixo. Evidência fraca, sombra ou falta de fundo comparável é marcada como **incerta**, em vez de ser convertida diretamente em ausência.
 - Presença confirmada, mesmo em um trecho longitudinal curto, interrompe a falha. A medição final não apaga plantas com um filtro de comprimento nem junta ausências através de plantas ou regiões incertas. A detecção geométrica de fileiras e sua proteção contra manchas isoladas continuam independentes dessa medição.
 - A confirmação usa objetos conectados no perfil da fileira: sementes de cor vegetal e contraste são expandidas somente sobre evidência fraca conectada e até 20 cm da semente. O núcleo deve ter pelo menos 0,003 m² de amostras e o objeto 0,01 m². Isso impede que uma touceira confirme um tapete inteiro de palhada conectado por variações de cor.
-- A semente precisa estar dentro da faixa da própria fileira. A largura mínima contígua parte de 4% do espaçamento, limitada a 6 cm, e se adapta à metade da largura típica de cada objeto, até 15 cm. Isso reduz a influência de bordas parciais e pontas de folhas sem impor a largura de uma touceira grande às pequenas isoladas. Objetos escuros sem confirmação suficiente ainda podem permanecer incertos.
+- A semente precisa estar dentro da faixa da própria fileira. A largura mínima contígua parte de 4% do espaçamento, limitada a 6 cm, e se adapta à metade da largura típica local de cada objeto em uma janela física de 1 m, até 15 cm. Isso reduz a influência de bordas parciais e pontas de folhas sem impor a largura de uma touceira grande às pequenas isoladas. O passo transversal não supera o pixel nativo e o halo depende da resolução, evitando que a divisão em blocos ou a direção de leitura redefina essa largura. Objetos escuros sem confirmação suficiente ainda podem permanecer incertos.
 - Na medição, o RGB e a máscara de validade são amostrados no pixel nativo mais próximo. Evita-se a mistura bilinear de folhas com solo que expandia a presença vegetal e eliminava falhas próximas do mínimo. O mínimo configurado não é reduzido. A reprojeção, quando necessária, continua sujeita ao detalhe disponível na imagem.
+- A leitura busca somente blocos de 256 × 256 pixels atravessados pela faixa, com cache de até 32 MiB. Evita ler o retângulo inteiro em torno de uma linha diagonal. O limite refere-se a esse cache, não à memória total do processamento.
 - Para cana moderadamente amarelada e clara, o perfil combina RGBVI `(G² − R×B)/(G² + R×B)`, proporção de azul e contraste com a entrelinha, sem exigir que G seja maior que R nem que a planta seja escura. Amarelecimento forte com contraste coerente, mas sem confirmação suficiente, gera revisão em vez de uma falha automática. Palhada amarela uniforme não confirma cultura apenas pela cor. Esses critérios são heurísticos, não um diagnóstico de clorose nem uma classificação botânica.
 - A medição respeita os metadados das bandas vermelha, verde e azul do TIFF; sem esses metadados, usa as bandas 1, 2 e 3 nessa ordem. Para avaliar cana amarelada, informe o **RGB original como imagem de referência**: uma máscara binária já perdeu essa informação de cor e não permite recuperá-la.
 - Variações fracas e dispersas de palhada não reiniciam o contador de ausência. Sombras coerentes e objetos ambíguos com apoio espacial suficiente continuam incertos; não se unem falhas através deles. A decisão considera áreas físicas, com vizinhança adicional entre blocos para reduzir efeitos das emendas de processamento.
@@ -177,7 +180,7 @@ A avaliação de diferentes índices/limiares e a dependência das condições d
      - `pct_pes`: Percentual do comprimento com apoio aceito para centralização.
      - `pct_proj`: Percentual do comprimento protegido e mantido na referência por falta de apoio confiável.
      - `origem`: Proveniência geométrica da fileira; identifica a inferência entre vizinhas e o registro de projeto.
-  2. **Segmentos de falha de plantio (`OUTPUT_GAPS`, opcional)**: camada `LineString` com `falha_id`, `linha_id`, `compr_m` e `categoria`, respeitando o mínimo configurado em centímetros.
+  2. **Segmentos de falha de plantio (`OUTPUT_GAPS`, opcional)**: camada `LineString` com `falha_id`, `linha_id`, `compr_m`, `categoria` e `evidencia`, respeitando o mínimo configurado em centímetros. `solo_e_nucleo` indica contribuição do refinamento de solo visível em parte do segmento; `ausencia_raster` indica a medição anterior. Esse campo descreve o método, não uma probabilidade ou certificação botânica.
   3. **Trechos incertos ou sem dados para revisão (`OUTPUT_REVIEW`, opcional)**: ative esta saída para visualizar onde o algoritmo não conseguiu concluir presença ou ausência. Contém `linha_id`, `compr_m` e `motivo` (`incerto` ou `sem_dados`). Esses trechos não são falhas confirmadas e não são filtrados pelo mínimo de falha. A saída é dispensável no fluxo normal e não altera as linhas.
 
 Em comparações com outras ferramentas, alinhe o mínimo de falha, a área avaliada, o CRS métrico e as linhas de referência. Contagem de segmentos e sobreposição entre programas medem diferenças/concordância, não acurácia de campo. Examine o RGB e os trechos de revisão antes de interpretar uma camada com menos falhas como melhor.
@@ -187,6 +190,10 @@ Em comparações com outras ferramentas, alinhe o mínimo de falha, a área aval
 ## Referências Metodológicas
 
 O estado de aprovação, o escopo e as instruções para reproduzir os testes estão em [VALIDACAO.md](VALIDACAO.md). Após a reestruturação 2.4, os nove cenários da bateria de aceitação passaram pelos critérios originais. Essa aprovação é restrita aos ensaios executados; não é uma estimativa de acurácia agronômica em todos os talhões.
+
+A nova comparação com o Inforow, a inspeção visual das divergências e a correção de dependência dos blocos na revisão 2.4.1 estão em [COMPARACAO_INFOROW.md](COMPARACAO_INFOROW.md). Essa revisão passou por 69 regressões e manteve a aprovação nos nove cenários completos.
+
+A revisão 2.5 de falhas curtas, os controles contra apagamento de plantas e os limites de interpretação estão em [FALHAS_CURTAS.md](FALHAS_CURTAS.md). A análise combina evidência espectral, contexto da fileira e morfologia de objetos, como motivado por [Souza et al. (2017)](https://doi.org/10.1016/j.compag.2017.10.006) e [Rocha et al. (2023)](https://doi.org/10.1016/j.inpa.2022.04.003). Os limiares e o código são próprios deste projeto.
 
 - Rocha et al. (2023) — *Automatic detection and evaluation of sugarcane planting rows from UAV RGB imagery* ([DOI: 10.1016/j.inpa.2022.04.003](https://doi.org/10.1016/j.inpa.2022.04.003))
 - Souza et al. (2017) — *Mapping skips in sugarcane fields using object-based image analysis* ([DOI: 10.1016/j.compag.2017.10.006](https://doi.org/10.1016/j.compag.2017.10.006))

@@ -11,6 +11,94 @@ gaps=importlib.util.module_from_spec(spec); spec.loader.exec_module(gaps)
 
 
 class GapTests(unittest.TestCase):
+    def test_native_tile_gather_matches_pixels_across_tile_boundaries(self):
+        from osgeo import gdal,osr
+        with tempfile.TemporaryDirectory() as temp:
+            path=str(Path(temp)/'native_values.tif')
+            ds=gdal.GetDriverByName('GTiff').Create(path,600,20,3,gdal.GDT_Byte)
+            ds.SetGeoTransform((600000,.05,0,8090000,0,-.05));srs=osr.SpatialReference();srs.ImportFromEPSG(31982);ds.SetProjection(srs.ExportToWkt())
+            yy,xx=np.mgrid[:20,:600]
+            for i,values in enumerate(((3*xx+yy)%251,(xx+5*yy)%251,(2*xx+7*yy)%251),1):ds.GetRasterBand(i).WriteArray(values.astype(np.uint8))
+            ds=None;sampler=gaps.GapRasterSampler(path,srs.ExportToWkt(),temp)
+            try:
+                cols=np.array([0,255,256,599,-1,600]);rows=np.array([0,0,7,19,8,1])
+                xy=np.column_stack([sampler.gt[0]+(cols+.5)*sampler.gt[1],sampler.gt[3]+(rows+.5)*sampler.gt[5]])
+                values,valid=sampler._native_sample(xy,(1,2,3,sampler.ds.RasterCount))
+                np.testing.assert_array_equal(valid,[1,1,1,1,0,0])
+                for band in range(3):
+                    expected=sampler.ds.GetRasterBand(band+1).ReadAsArray()[rows[:4],cols[:4]]
+                    np.testing.assert_array_equal(values[band,:4],expected)
+                np.testing.assert_array_equal(sampler.valid_points(xy),valid)
+            finally:sampler.close()
+
+    def short_gap_scene(self):
+        offsets=np.linspace(-.675,.675,45)
+        rgb=np.tile(np.array([168.,152.,125.]),(70,45,1))
+        rgb[:25,np.abs(offsets)<.12]=[40,150,30]
+        rgb[35:,np.abs(offsets)<.12]=[40,150,30]
+        # Thin peripheral foliage masks an exact 50 cm soil interval in the
+        # old whole-corridor presence profile. No plant body occupies it.
+        rgb[:,np.abs(offsets-.27)<.035]=[40,150,30]
+        return offsets,rgb
+
+    def test_visible_50cm_gap_is_recovered_despite_peripheral_leaf(self):
+        offsets,rgb=self.short_gap_scene();args=(*[rgb[:,:,i] for i in range(3)],np.ones(rgb.shape[:2],bool),offsets,1.5)
+        conservative=gaps.classify_cross_sections(*args,refine_visible=False)
+        refined,evidence=gaps.classify_cross_sections(*args,return_evidence=True)
+        self.assertFalse(gaps.intervals_from_states(np.arange(71)*.05,conservative,.5)[0])
+        found,_=gaps.intervals_from_states(np.arange(71)*.05,refined,.5)
+        self.assertEqual(len(found),1)
+        self.assertAlmostEqual(found[0][0],1.25);self.assertAlmostEqual(found[0][1],1.75)
+        self.assertTrue(evidence['recovered'][25:35].all())
+
+    def test_off_axis_stool_vetoes_visible_soil_recovery(self):
+        offsets,rgb=self.short_gap_scene()
+        rgb[28:32,np.abs(offsets-.27)<.07]=[110,101,73]
+        states=gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],np.ones(rgb.shape[:2],bool),offsets,1.5)
+        self.assertTrue((states[28:32]==1).all())
+        self.assertFalse(gaps.intervals_from_states(np.arange(71)*.05,states,.5)[0])
+
+    def test_central_short_plant_always_interrupts_visible_gap(self):
+        offsets,rgb=self.short_gap_scene();rgb[30,np.abs(offsets)<.12]=[40,150,30]
+        states=gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],np.ones(rgb.shape[:2],bool),offsets,1.5)
+        self.assertEqual(states[30],1)
+        self.assertFalse(gaps.intervals_from_states(np.arange(71)*.05,states,.5)[0])
+
+    def test_unbounded_skinny_object_is_not_reclassified_as_total_gap(self):
+        offsets=np.linspace(-.675,.675,45);rgb=np.tile(np.array([168.,152.,125.]),(80,45,1))
+        rgb[:,np.abs(offsets-.27)<.035]=[40,150,30]
+        states,evidence=gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],
+            np.ones(rgb.shape[:2],bool),offsets,1.5,return_evidence=True)
+        self.assertFalse(evidence['recovered'].any())
+        self.assertTrue((states==1).all())
+
+    def test_variable_width_objects_are_independent_of_block_read_direction(self):
+        from osgeo import gdal,osr
+        class Feedback:
+            def isCanceled(self):return False
+        with tempfile.TemporaryDirectory() as temp:
+            path=str(Path(temp)/'variable_width.tif')
+            ds=gdal.GetDriverByName('GTiff').Create(path,800,100,3,gdal.GDT_Byte)
+            ds.SetGeoTransform((600000,.05,0,8090000,0,-.05))
+            srs=osr.SpatialReference();srs.ImportFromEPSG(31982);ds.SetProjection(srs.ExportToWkt())
+            yy,xx=np.mgrid[:100,:800];u=(xx+.5)*.05
+            width=np.where((u<7.)|(u>27.),.30,.10)
+            crop=abs((yy+.5)*.05-2.5)<width/2
+            for i,(soil,cane) in enumerate(zip([168,152,125],[40,150,30]),1):
+                ds.GetRasterBand(i).WriteArray(np.where(crop,cane,soil).astype(np.uint8))
+            ds=None
+            sampler=gaps.GapRasterSampler(path,srs.ExportToWkt(),temp)
+            try:
+                edges,centres,normals=gaps.sample_polyline([[600000,8089997.5],[600040,8089997.5]],.05)
+                forward=sampler.states(centres,normals,1.5,Feedback())
+                reverse=sampler.states(centres[::-1],normals[::-1],1.5,Feedback())[::-1]
+                np.testing.assert_array_equal(forward,reverse)
+                # A narrow connected row is not bare merely because another
+                # part of the same object is wider many metres away.
+                self.assertTrue((forward[200:500]==1).all())
+                self.assertFalse(gaps.intervals_from_states(edges,forward,.5)[0])
+            finally:sampler.close()
+
     def _section(self,background,colour,width=.20,rows=20,dtype=float,centre=0.):
         offsets=np.linspace(-.675,.675,45)
         rgb=np.tile(np.array(background,dtype=dtype),(rows,45,1))

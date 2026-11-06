@@ -33,6 +33,7 @@ CASES={
     'automatic_healthy':dict(curved=False,angle=0,colour=[40,150,30],planned=False,shift=0.,healthy=True),
     'automatic_oblique':dict(curved=False,angle=33,colour=[40,150,30],planned=False,shift=0.),
     'automatic_contour':dict(curved=True,angle=0,colour=[40,150,30],planned=False,shift=0.),
+    'short_gap_leaf_overlap':dict(curved=False,angle=0,colour=[40,150,30],planned=True,shift=0.,peripheral_leaf=True),
 }
 
 def load_algorithms():
@@ -106,6 +107,10 @@ def make_fixture(directory,config):
         for a,b in gaps[row]:occupied &= ~((uu>=a)&(uu<b))
         crop |= occupied & (abs(vv-(2+row*1.5+curve(uu,config['curved'])))<.15)
     crop &= valid
+    if config.get('peripheral_leaf'):
+        # A lateral leaf crosses the 50 cm gap on row zero; the true gap and
+        # its planting axis remain unchanged. This is not a plant at its centre.
+        crop |= valid&(uu>=4.)&(uu<6.)&(abs(vv-(2.+curve(uu,config['curved'])+.27))<.035)
     raster=directory/'rgb.tif';ds=gdal.GetDriverByName('GTiff').Create(str(raster),width,height,4,gdal.GDT_Byte)
     ds.SetGeoTransform((xmin,resolution,0,ymax,0,-resolution));srs=osr.SpatialReference();srs.ImportFromEPSG(31982);ds.SetProjection(srs.ExportToWkt())
     for i,(soil,cane,interp) in enumerate(zip([168,152,125],config['colour'],[gdal.GCI_RedBand,gdal.GCI_GreenBand,gdal.GCI_BlueBand]),1):
@@ -155,6 +160,7 @@ def audit(rows,segments,truth,expected):
     duplicate=sum(max(0,len(part)-1) for part in assigned)
     crossing=sum(lines[i].crosses(lines[j]) for i in range(len(lines)) for j in range(i))
     return {'rows':len(lines),'expected_rows':len(truth),'assigned_parts_per_row':[len(p) for p in assigned],
+        'row_geometry_sha256':hashlib.sha256(b''.join(bytes(g.asWkb()) for g in lines)).hexdigest(),
         'origins':{key:sum(f['origem']==key for f in rows.getFeatures()) for key in
             set(f['origem'] for f in rows.getFeatures())} if 'origem' in rows.fields().names() else {},
         'invalid_rows':sum(not g.isGeosValid() for g in lines),'crossing_pairs':crossing,
@@ -194,7 +200,8 @@ def run_case(name,output):
         context.temporaryLayerStore().addMapLayer(planned)
         second=Second();second.initAlgorithm()
         params={'INPUT_RASTER':str(raster),'INPUT_POINTS':cloud.id(),'MIN_GAP_CM':50.,'ROW_SPACING':1.5,
-            'OUTPUT':'memory:','OUTPUT_GAPS':'memory:','OUTPUT_REVIEW':'memory:'}
+            'OUTPUT':'memory:','OUTPUT_GAPS':'memory:','OUTPUT_REVIEW':'memory:',
+            'REFINE_VISIBLE_GAPS':config.get('refine_visible',True)}
         if config['planned']:params['INPUT_PLANNED_LINES']=planned.id()
         res=second.processAlgorithm(params,context,feedback)
         rows=QgsProcessingUtils.mapLayerFromString(res['OUTPUT'],context)
