@@ -11,6 +11,73 @@ gaps=importlib.util.module_from_spec(spec); spec.loader.exec_module(gaps)
 
 
 class GapTests(unittest.TestCase):
+    def test_plant_core_outside_its_lane_cannot_dilate_into_crop_evidence(self):
+        states=self._section([168,152,125],[40,150,30],width=.18,centre=.57,rows=60)
+        self.assertFalse((states==1).any())
+
+    def test_observed_axis_at_image_edge_is_not_lost_with_missing_outer_samples(self):
+        offsets=np.linspace(-.675,.675,45);rgb=np.tile(np.array([168.,152.,125.]),(30,45,1))
+        valid=np.broadcast_to(offsets>=-.03,rgb.shape[:2]).copy()
+        states=gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],valid,offsets,1.5)
+        np.testing.assert_array_equal(states,0)
+        valid[:,abs(offsets)<.04]=False
+        states=gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],valid,offsets,1.5)
+        np.testing.assert_array_equal(states,-1)
+
+    def test_long_visible_gap_crosses_read_blocks_and_respects_nodata(self):
+        from osgeo import gdal,osr
+        class Feedback:
+            def isCanceled(self):return False
+        for missing in (False,True):
+            with self.subTest(nodata=missing),tempfile.TemporaryDirectory() as temp:
+                path=str(Path(temp)/'long_gap.tif');ds=gdal.GetDriverByName('GTiff').Create(path,1200,80,4,gdal.GDT_Byte)
+                ds.SetGeoTransform((600000,.05,0,8090000,0,-.05));srs=osr.SpatialReference();srs.ImportFromEPSG(31982);ds.SetProjection(srs.ExportToWkt())
+                yy,xx=np.mgrid[:80,:1200];u=(xx+.5)*.05;v=2.-(yy+.5)*.05
+                crop=((abs(v)<.12)&((u<12.)|(u>=47.)))|(abs(v-.27)<.035)
+                for i,(soil,cane) in enumerate(zip([168,152,125],[40,150,30]),1):ds.GetRasterBand(i).WriteArray(np.where(crop,cane,soil).astype(np.uint8))
+                valid=~((u>=25)&(u<26)) if missing else np.ones(u.shape,bool)
+                ds.GetRasterBand(4).WriteArray((valid*255).astype(np.uint8));ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand);ds=None
+                sampler=gaps.GapRasterSampler(path,srs.ExportToWkt(),temp)
+                try:
+                    edges,c,n=gaps.sample_polyline([[600000,8089998],[600060,8089998]],.05)
+                    forward=sampler.states(c,n,1.5,Feedback())
+                    reverse=sampler.states(c[::-1],n[::-1],1.5,Feedback())[::-1]
+                    np.testing.assert_array_equal(forward,reverse)
+                    found,_=gaps.intervals_from_states(edges,forward,.5)
+                    self.assertEqual(len(found),2 if missing else 1)
+                    self.assertAlmostEqual(found[0][0],12.,delta=.051)
+                    self.assertAlmostEqual(found[-1][1],47.,delta=.051)
+                    if missing:
+                        self.assertTrue((forward[500:520]==-1).all())
+                        self.assertLessEqual(found[0][1],25.001);self.assertGreaterEqual(found[1][0],25.999)
+                finally:sampler.close()
+
+    def test_long_visible_gap_is_not_limited_to_three_metres(self):
+        offsets=np.linspace(-.675,.675,45)
+        rgb=np.tile(np.array([168.,152.,125.]),(200,45,1))
+        rgb[:40,np.abs(offsets)<.12]=[40,150,30]
+        rgb[140:,np.abs(offsets)<.12]=[40,150,30]
+        rgb[:,np.abs(offsets-.27)<.035]=[40,150,30]
+        states=gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],
+            np.ones(rgb.shape[:2],bool),offsets,1.5)
+        found,_=gaps.intervals_from_states(np.arange(201)*.05,states,.5)
+        self.assertEqual(len(found),1)
+        self.assertAlmostEqual(found[0][0],2.);self.assertAlmostEqual(found[0][1],7.)
+
+    def test_compact_crop_just_outside_old_corridor_is_not_total_gap(self):
+        for colour in ([40,150,30],[110,101,73]):
+            with self.subTest(colour=colour):
+                states=self._section([168,152,125],colour,width=.14,centre=.42,rows=60)
+                self.assertTrue((states==1).all())
+
+    def test_thin_outer_leaf_alone_does_not_confirm_shoulder_stool(self):
+        states=self._section([168,152,125],[40,150,30],width=.025,centre=.42,rows=60)
+        self.assertFalse((states==1).any())
+
+    def test_bright_weak_foliage_is_review_instead_of_confirmed_gap(self):
+        states=self._section([168,152,125],[190,180,130],rows=60)
+        np.testing.assert_array_equal(states,-2)
+
     def test_native_tile_gather_matches_pixels_across_tile_boundaries(self):
         from osgeo import gdal,osr
         with tempfile.TemporaryDirectory() as temp:
@@ -144,9 +211,11 @@ class GapTests(unittest.TestCase):
     def test_outer_canopy_cannot_confirm_weak_foliage_inside_empty_corridor(self):
         offsets=np.linspace(-.675,.675,45)
         rgb=np.tile(np.array([168.,152.,125.]),(40,45,1))
-        rgb[:,(offsets<-.35)&(offsets>-.49)]=[50,150,35]
+        # Outside the expanded compact-stool shoulder (50 cm), not merely
+        # outside the old 35 cm general foliage corridor.
+        rgb[:,(offsets<-.50)&(offsets>-.65)]=[50,150,35]
         # Weak, bright leaf tips near the outer edge, no row seed inside.
-        rgb[:,(offsets>-.35)&(offsets<-.23)]=[160,159,125]
+        rgb[:,(offsets>-.50)&(offsets<-.23)]=[160,159,125]
         states=gaps.classify_cross_sections(*[rgb[:,:,i] for i in range(3)],
             np.ones((40,45),bool),offsets,1.5)
         self.assertFalse((states==1).any())

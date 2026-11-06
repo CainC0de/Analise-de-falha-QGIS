@@ -65,34 +65,35 @@ def _metric_disk(radius, along_step, cross_step):
     return y[:,None]**2+x[None,:]**2<=radius**2+1e-12
 
 
-def visible_soil_support(crop, vegetation, labels, valid, seed, soil, offsets,
-                         spacing, longitudinal_step, diagnostics=None):
-    """Visible axial soil can overrule peripheral leaves, never a plant body.
+def bounded_visible_absence(visible, body_present, eligible, longitudinal_step, unknown=None):
+    """Recover only visible soil bracketed by nearby plant bodies, at any length.
 
-    Geometry and metric minimum are unchanged. Compact off-axis plants and
-    central seeds veto recovery. This is not inference beneath a closed canopy.
+    Evaluate this once on the assembled row as well as on individual profiles:
+    a long absence must not need both of its ends inside one read block.
     """
+    recovered=np.zeros(len(visible),dtype=bool)
+    unknown=np.zeros(len(visible),bool) if unknown is None else np.asarray(unknown,bool)
+    limits=np.r_[0,np.flatnonzero(np.diff(visible.astype(int)))+1,len(visible)]
+    look=max(1,int(math.ceil(.30/longitudinal_step)))
+    for a,b in zip(limits[:-1],limits[1:]):
+        left=body_present[max(0,a-look):a].any();right=body_present[b:min(len(visible),b+look)].any()
+        left_unknown=a>0 and unknown[a-1];right_unknown=b<len(visible) and unknown[b]
+        # A validity boundary can truncate a supported visible absence; it
+        # never becomes observed soil and never connects the two gap parts.
+        if (not visible[a] or not (left or right) or not (left or left_unknown)
+                or not (right or right_unknown)):continue
+        recovered[a:b]=eligible[a:b]
+    return recovered
+
+
+def plant_body_pixels(material, labels, valid, offsets, longitudinal_step, core_lane=None):
+    """Compact/inscribed plant evidence; thin leaves do not become stool cores."""
     cross_step=float(np.median(np.diff(offsets)))
-    recovered=np.zeros(len(crop),dtype=bool)
-    if longitudinal_step>.06 or cross_step>.06:return recovered
-    inner=np.abs(offsets)<=min(.35,.28*spacing)
-    central=np.abs(offsets)<=min(.10,.09*spacing)
-    seed_axis=np.abs(offsets)<=min(.04,.04*spacing)
-    known=valid[:,central].sum(axis=1)>=max(2,int(math.ceil(.90*central.sum())))
-    soil_fraction=(soil[:,central]&valid[:,central]).sum(axis=1)/np.maximum(1,valid[:,central].sum(axis=1))
-    # Soil dominance already vetoes a centrally occupied plant. A single
-    # central leaf pixel must not veto the entire interval on its own.
-    axis_plant=(seed[:,central]&valid[:,central]).sum(axis=1)>(.25*central.sum())
-    candidate=crop&known&(soil_fraction>=.80)&~axis_plant
-    if diagnostics is not None:
-        diagnostics.update(soil_fraction=soil_fraction,axis_plant=axis_plant,
-                           body_present=np.zeros(len(crop),bool),candidate=candidate)
-    if not candidate.any():return recovered
+    if not material.any():return np.zeros(material.shape,bool)
     radius=max(.055,longitudinal_step,cross_step)
     element=_metric_disk(radius,longitudinal_step,cross_step)
     closing=_metric_disk(.035,longitudinal_step,cross_step)
     py,px=element.shape[0]//2+1,element.shape[1]//2+1
-    material=vegetation&~soil
     padded=np.pad(material,((py,py),(px,px)),mode='edge')
     closed=ndi.binary_closing(padded,structure=closing)
     distance=ndi.distance_transform_edt(closed,sampling=(longitudinal_step,cross_step))
@@ -100,35 +101,47 @@ def visible_soil_support(crop, vegetation, labels, valid, seed, soil, offsets,
                  max(3,int(math.ceil(.3/cross_step))|1))
     peaks=ndi.maximum_filter(distance,size=peak_window,mode='nearest')
     core=((distance>=radius)&(distance>=.75*peaks))[py:-py,px:-px]
-    core &= inner[None,:]
+    if core_lane is not None:core&=np.asarray(core_lane,bool)[None,:]
     body=ndi.binary_dilation(core,structure=element)&valid
-    body_present=body[:,inner].any(axis=1)
     # A small isolated stool can be below the opening diameter. Preserve
     # compact objects even off-axis, while rejecting long thin leaf fragments.
-    for obj in np.unique(labels[material&candidate[:,None]]):
+    for obj in np.unique(labels[material]):
         rr,cc=np.nonzero(material&(labels==obj))
         if not len(rr):continue
         height=(rr.max()-rr.min()+1)*longitudinal_step
         width=(cc.max()-cc.min()+1)*cross_step
         area=len(rr)*longitudinal_step*cross_step
         compact=(max(height,width)<=4*min(height,width) and area>=.01
-                 and area>=.35*height*width
-                 and abs(float(np.mean(offsets[cc])))<=min(.35,.28*spacing))
+                 and area>=.35*height*width)
         if compact:
             centre=float(np.median(rr));reach=max(.05,min(.10,.20*height))/longitudinal_step
-            body_present[np.abs(np.arange(len(crop))-centre)<=reach]=True
-    if diagnostics is not None:diagnostics['body_present']=body_present
-    # Recover bounded visible intervals between actual plant bodies. A long
-    # skinny green row/weed stripe is not reinterpreted as a total planting gap.
+            col=int(round(float(np.median(cc))))
+            if core_lane is not None and not core_lane[col]:continue
+            selected=np.abs(np.arange(len(material))-centre)<=reach
+            body[selected,col]=valid[selected,col]
+    return body
+
+
+def visible_soil_support(crop, vegetation, labels, valid, seed, soil, offsets,
+                         spacing, longitudinal_step, diagnostics=None, body=None):
+    """Visible axial soil can overrule peripheral leaves, never a plant body."""
+    cross_step=float(np.median(np.diff(offsets)))
+    recovered=np.zeros(len(crop),dtype=bool)
+    if longitudinal_step>.06 or cross_step>.06:return recovered
+    # A compact displaced stool still vetoes absence in the shoulder band.
+    inner=np.abs(offsets)<=min(.50,.35*spacing)
+    central=np.abs(offsets)<=min(.10,.09*spacing)
+    known=valid[:,central].sum(axis=1)>=max(2,int(math.ceil(.90*central.sum())))
+    soil_fraction=(soil[:,central]&valid[:,central]).sum(axis=1)/np.maximum(1,valid[:,central].sum(axis=1))
+    axis_plant=(seed[:,central]&valid[:,central]).sum(axis=1)>(.25*central.sum())
+    candidate=crop&known&(soil_fraction>=.80)&~axis_plant
+    if body is None:body=plant_body_pixels(vegetation&~soil,labels,valid,offsets,longitudinal_step,core_lane=inner)
+    body_present=body[:,inner].any(axis=1)
     visible=known&(soil_fraction>=.80)&~axis_plant&~body_present
-    limits=np.r_[0,np.flatnonzero(np.diff(visible.astype(int)))+1,len(visible)]
-    look=max(1,int(math.ceil(.30/longitudinal_step)))
-    for a,b in zip(limits[:-1],limits[1:]):
-        if (not visible[a] or (b-a)*longitudinal_step>min(3.,2*spacing)
-                or not body_present[max(0,a-look):a].any()
-                or not body_present[b:min(len(visible),b+look)].any()):continue
-        recovered[a:b]=candidate[a:b]
-    return recovered
+    if diagnostics is not None:
+        diagnostics.update(soil_fraction=soil_fraction,axis_plant=axis_plant,
+                           body_present=body_present,candidate=candidate,visible=visible)
+    return bounded_visible_absence(visible,body_present,candidate,longitudinal_step,unknown=~known)
 
 
 def classify_cross_sections(r, g, b, valid, offsets, spacing, longitudinal_step=0.05,
@@ -215,7 +228,10 @@ def classify_cross_sections(r, g, b, valid, offsets, spacing, longitudinal_step=
         crop|=supported;core_objects[obj]=supported.any()
     # Only spatially coherent ambiguity interrupts absence. A single weak
     # colour pixel no longer resets the minimum-gap counter every few cm.
-    ambiguous_pixels = ((weak & (total < 0.90*bg_light)) | chlorotic) & ~vegetation
+    # Bright, partly bleached foliage can have coherent colour contrast without
+    # being darker than straw. Weak evidence protects it as review, never soil.
+    bright_weak=(weak&(exg>.055)&(rgbvi>.12)&(dv>.05)&(db>.015)&(dn>.005))
+    ambiguous_pixels = ((weak & (total < 0.90*bg_light)) | chlorotic | bright_weak) & ~vegetation
     ambiguous_labels, n_ambiguous = ndi.label(ambiguous_pixels, structure=np.ones((3,3),dtype=bool))
     ambiguous_areas = np.bincount(ambiguous_labels.ravel(), minlength=n_ambiguous+1)*pixel_area
     ambiguous = ambiguous_areas >= 0.025
@@ -233,10 +249,39 @@ def classify_cross_sections(r, g, b, valid, offsets, spacing, longitudinal_step=
         unsure | ~background_known,-2,0))).astype(np.int8)
     soil=(valid&~seed&~chlorotic&(total>.70*bg_light)
           &(((de<.035)&(dn<.015))|((rgbvi<.09)&(ngrdi<.01))))
+    # The old fixed 35 cm corridor could declare absence through a genuine
+    # stool just outside it. Expand only the compact-body veto, not the general
+    # leaf-presence corridor or the inter-row background samples.
+    body=None
+    expanded=np.abs(offsets)<=min(.50,.35*spacing)
+    shoulder=expanded&~inner
+    if longitudinal_step<=.06 and cross_step<=.06:
+        broad_seed=seed&expanded[None,:]
+        broad_seeded=np.bincount(labels[broad_seed],minlength=count+1)*pixel_area>=.003
+        broad_accepted=broad_seeded&(areas>=.01);broad_accepted[0]=False
+        broad_distance=(ndi.distance_transform_edt(~broad_seed,sampling=(longitudinal_step,cross_step))
+                        if broad_seed.any() else np.full(seed.shape,np.inf))
+        broad_vegetation=broad_accepted[labels]&(broad_distance<=.20)
+        body=plant_body_pixels(broad_vegetation&~soil,labels,valid,offsets,longitudinal_step,core_lane=expanded)
+        shoulder_crop=body[:,shoulder].any(axis=1)
+        baseline[(baseline!=-1)&shoulder_crop]=1
+    # At a valid image edge an oblique cross-section can be partly outside the
+    # footprint while its planting axis is still observed. Do not discard that
+    # observed length solely because 25% of the lateral corridor is missing.
+    # Require valid axial pixels, visible central soil and no observed plant.
+    axis=np.abs(offsets)<=max(.025,cross_step/2)
+    central=np.abs(offsets)<=min(.10,.09*spacing)
+    central_count=valid[:,central].sum(axis=1)
+    central_soil=(soil[:,central]&valid[:,central]).sum(axis=1)
+    body_present=(body[:,expanded].any(axis=1) if body is not None else crop)
+    partial_soil=((baseline==-1)&valid[:,axis].all(axis=1)&(central_count>=2)
+                  &(central_soil>=.80*central_count)&background_known&~crop&~body_present)
+    baseline[partial_soil]=0
     details={}
     eligible=(baseline==1)|(baseline==-2)
     recovered=visible_soil_support(eligible,vegetation,labels,valid,seed,soil,
-        offsets,spacing,longitudinal_step,diagnostics=details if return_evidence else None) if refine_visible else np.zeros(len(crop),bool)
+        offsets,spacing,longitudinal_step,diagnostics=details if return_evidence else None,
+        body=body) if refine_visible else np.zeros(len(crop),bool)
     states=baseline.copy();states[recovered&(baseline!=-1)]=0
     if return_evidence:return states,dict(baseline=baseline,recovered=recovered,soil=soil,**details)
     return states
@@ -362,6 +407,7 @@ class GapRasterSampler:
         self.last_baseline=states.copy()
         self.last_soil_fraction=np.zeros(len(centres));self.last_axis_plant=np.zeros(len(centres),bool)
         self.last_body_present=np.zeros(len(centres),bool)
+        visible=np.zeros(len(centres),bool);eligible=np.zeros(len(centres),bool)
         along_step = float(np.median(np.linalg.norm(np.diff(centres,axis=0),axis=1))) if len(centres)>1 else self.res
         cross_step=float(np.median(np.diff(offsets)))
         # Cover local width, bounded growth and the longest one-cell component
@@ -394,6 +440,8 @@ class GapRasterSampler:
                     self.last_soil_fraction[start:stop]=evidence['soil_fraction'][selection]
                     self.last_axis_plant[start:stop]=evidence['axis_plant'][selection]
                     self.last_body_present[start:stop]=evidence['body_present'][selection]
+                    visible[start:stop]=evidence['visible'][selection]
+                    eligible[start:stop]=evidence['candidate'][selection]
                 continue
             else:
                 classified=values[0]
@@ -405,6 +453,11 @@ class GapRasterSampler:
             crop=evidence.any(axis=1)
             states[start:stop]=np.where(known,np.where(crop,1,0),-1)[selection]
             self.last_baseline[start:stop]=states[start:stop]
+        if self.rgb and self.refine_visible:
+            recovered=bounded_visible_absence(visible,self.last_body_present,eligible,along_step,
+                unknown=self.last_baseline==-1)
+            self.last_refined|=recovered
+            states[self.last_refined&(self.last_baseline!=-1)]=0
         return states
 
     def close(self):

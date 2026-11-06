@@ -2,6 +2,8 @@
 
 Data: 5 de novembro de 2026.
 
+**Revisão 2.6, de 6 de novembro:** os testes de ausências longas, cultura deslocada, NoData e continuidade automática foram ampliados. Diagnóstico, execução reproduzível e limites estão em [AUDITORIA_FALHAS_2_6.md](AUDITORIA_FALHAS_2_6.md). Os resultados históricos abaixo continuam identificados por revisão.
+
 **Atualização 2.5:** a bateria de regressão ampliada passou por **75 testes**, incluindo o fluxo completo de uma falha de 50 cm atravessada por folha lateral, preservação das geometrias e controles de plantas deslocadas. Método, reprodução e limites estão em [FALHAS_CURTAS.md](FALHAS_CURTAS.md). Os resultados históricos abaixo identificam suas respectivas revisões; não devem ser atribuídos automaticamente à 2.5.
 
 **Parecer: os nove cenários da bateria de aceitação foram aprovados após a reestruturação, com os mesmos critérios de geometria, correspondência, mínimo de 50 cm e erro de comprimento.**

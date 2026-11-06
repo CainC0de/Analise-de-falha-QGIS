@@ -34,6 +34,8 @@ CASES={
     'automatic_oblique':dict(curved=False,angle=33,colour=[40,150,30],planned=False,shift=0.),
     'automatic_contour':dict(curved=True,angle=0,colour=[40,150,30],planned=False,shift=0.),
     'short_gap_leaf_overlap':dict(curved=False,angle=0,colour=[40,150,30],planned=True,shift=0.,peripheral_leaf=True),
+    'automatic_large_gap':dict(curved=False,angle=0,colour=[40,150,30],planned=False,shift=0.,large_gap=True),
+    'automatic_large_contour_gap':dict(curved=True,angle=0,colour=[40,150,30],planned=False,shift=0.,large_gap=True),
 }
 
 def load_algorithms():
@@ -85,6 +87,7 @@ def make_fixture(directory,config):
     directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)
     # Five rows, including one entirely empty and one completely planted row.
     gaps=[[(5,5.5),(10,10.95),(20,22)],[(0,1),(8,9.5),(24,26)],[(0,32)],[],[(15,16.5)]]
+    if config.get('large_gap'):gaps[1]=[(8,24)]
     if config.get('healthy'):gaps=[[] for _ in range(5)]
     u=np.linspace(0,32,1601);truth=[];references=[];expected=[]
     for row in range(5):

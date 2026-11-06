@@ -11,7 +11,7 @@ from scipy.signal import fftconvolve
 from scipy.spatial import cKDTree
 from .cane_centers import detect_stool_centers, fit_center_offsets, row_context_support
 from .planting_gaps import GapRasterSampler, intervals_from_states, sample_polyline, segment_coordinates, review_intervals
-from .row_network import clip_native, complete_network, register_empty_rows
+from .row_network import clip_native, complete_network, connect_observed_fragments, register_empty_rows
 from qgis.PyQt.QtCore import QVariant
 from qgis.core import (
     QgsCoordinateTransform,
@@ -120,7 +120,7 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             type=QgsProcessingParameterNumber.Double, defaultValue=50.0, minValue=1.0,
         ))
         self.addParameter(QgsProcessingParameterBoolean(
-            self.REFINE_VISIBLE_GAPS,'Melhorar detecção de falhas curtas com solo visível (RGB)',
+            self.REFINE_VISIBLE_GAPS,'Melhorar detecção de falhas com solo visível (RGB)',
             defaultValue=True))
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUTPUT,
@@ -317,11 +317,21 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                 # tracer: otherwise its curvature bias propagates into gaps.
                 observed=polylines
                 refined=[np.array([(p.x(),p.y()) for p in item[0]]) for item in observed]
+                refined,self._row_observation_support,initial_origins=connect_observed_fragments(
+                    refined,spacing,feedback,self._row_observation_support,
+                    max_bridge=min(60.,max(12.,6*max_gap)))
+                observed=[]
+                for xy,w in zip(refined,self._row_observation_support):
+                    length=float(np.linalg.norm(np.diff(xy,axis=0),axis=1).sum())
+                    angle=math.degrees(math.atan2(*(xy[-1]-xy[0])[::-1]))%180
+                    observed.append(([QgsPointXY(float(x),float(y)) for x,y in xy],
+                        angle,length,0.,0.,0,100.*float(np.mean(w)),100.*float(np.mean(~w))))
                 with tempfile.TemporaryDirectory(prefix='cane_row_network_') as directory:
                     sampler=GapRasterSampler(raster.source(),crs.toWkt(),directory)
                     try:
                         completed,origins=complete_network(refined,spacing,sampler,feedback,
-                            max_extension=min(max_gap,3*spacing),support=self._row_observation_support)
+                            max_extension=min(max_gap,3*spacing),support=self._row_observation_support,
+                            initial_origins=initial_origins)
                         completed,owners=clip_native(completed,sampler,feedback)
                     finally:sampler.close()
                 polylines=[];self._line_provenance=[]
@@ -340,6 +350,8 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
                     self._line_provenance.append(origins[owner])
                 feedback.pushInfo(f'Fileiras interiores inferidas por vizinhas regulares: '
                     f'{origins.count("inferida_entre_vizinhas")}.')
+                feedback.pushInfo(f'Fileiras com fragmentos ligados por duas vizinhas observadas: '
+                    f'{origins.count("observada_conectada")}.')
             del raster_density, green_contrast, valid_field_mask
 
         if feedback.isCanceled():
@@ -1594,7 +1606,8 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             'Manchas isoladas entre falhas e trechos sem continuidade confiável não '
             'deslocam a referência; o percentual protegido aparece em pct_proj. '
             'Essa proteção não identifica botanicamente plantas invasoras.\n\n'
-            'O campo origem distingue projeto, projeto_registrado, observada e '
+            'O campo origem distingue projeto, projeto_registrado, observada, '
+            'observada_conectada e '
             'inferida_entre_vizinhas. Fileiras vazias só são inferidas entre vizinhas '
             'paralelas com espaçamento regular e sobreposição suficiente; não são '
             'criadas além das fileiras externas. Referências sem apoio próprio podem '
@@ -1613,13 +1626,17 @@ class RestituirLinhasAlgorithm(QgsProcessingAlgorithm):
             '3. Quando "Linhas projetadas" não é informada:\n'
             '   - Estima o campo 2D de orientação local via FFT em janelas e aplica '
             'filtragem direcional adaptativa (comb filter) com retificação automática '
-            'de tiros retos, seguida do mesmo refinamento de centros com flexão limitada.\n'
+            'de tiros retos, seguida do mesmo refinamento de centros com flexão limitada. '
+            'Fragmentos separados podem ser ligados somente quando duas fileiras '
+            'observadas, uma de cada lado, cobrem o intervalo e confirmam o mesmo '
+            'alinhamento nas duas pontas. A conexão não confirma presença de cultura.\n'
             '4. Mede a ausência de vegetação no raster original, em faixa estreita '
             'sem dilatação. O tamanho mínimo é configurado em centímetros '
             '(padrão: 50 cm). NoData não é considerado falha. '
-            'A opção "Melhorar detecção de falhas curtas com solo visível (RGB)" '
+            'A opção "Melhorar detecção de falhas com solo visível (RGB)" '
             'combina solo visível no eixo e núcleos compactos das touceiras para '
-            'reduzir omissões causadas por folhas laterais. Exige resolução de '
+            'reduzir omissões causadas por folhas laterais, também em ausências '
+            'longas atravessando blocos de leitura. Exige resolução de '
             'até 6 cm, conserva plantas deslocadas e não infere solo sob dossel '
             'fechado. O campo evidencia registra solo_e_nucleo quando essa '
             'análise contribui para o segmento; os demais usam ausencia_raster. '

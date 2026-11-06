@@ -9,6 +9,12 @@ spec=importlib.util.spec_from_file_location('acceptance_pipeline_helper',ROOT/'s
 acceptance=importlib.util.module_from_spec(spec);spec.loader.exec_module(acceptance)
 
 class PipelineAcceptanceTests(unittest.TestCase):
+    def test_automatic_large_absence_keeps_a_complete_row(self):
+        for case in ('automatic_large_gap','automatic_large_contour_gap'):
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as temp:
+                report=acceptance.run_case(case,temp)
+                self.assertIsNone(report['error'],report.get('traceback'))
+                self.assertTrue(all(report['gates'].values()),report['gates'])
     def test_visible_soil_switch_recovers_short_gap_without_moving_rows(self):
         legacy=dict(acceptance.CASES['short_gap_leaf_overlap'],refine_visible=False)
         name='short_gap_leaf_overlap_legacy_test';acceptance.CASES[name]=legacy

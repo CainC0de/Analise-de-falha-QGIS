@@ -1,0 +1,298 @@
+{
+  "version": "2.6",
+  "date": "2026-11-06",
+  "regressions": {
+    "run": 93,
+    "successful": true
+  },
+  "environment": {
+    "qgis": "3.44.11-Solothurn",
+    "python": "3.12.13 (main, Apr 16 2026, 15:59:38) [MSC v.1944 64 bit (AMD64)]",
+    "gdal": "3130000"
+  },
+  "production_sha256": {
+    "planting_gaps.py": "2bcd785e69f280b0953fe85ee1bb1022c7a9034a04244719f7429abbd5597743",
+    "cane_centers.py": "e9a8bdc2ca52a32ed9002e07650356efd0869104762b1d972267816d4c1da352",
+    "RestituirLinhasAlgorithm.py": "78ce91b7dfa17c0cb7e2683b58a6070ba7e2a2ad834cfba0c0c403ed60e6f283",
+    "Falhadeplantio_algorithm.py": "0beb94f780b4befb261546a4fa47d63abaaa5997523815a87ffc30fc6177ee4a",
+    "row_network.py": "8790bc00740d7cc2df876ff07b3efd50996ef0ed27e6a4fdf202c6f7554462e6"
+  },
+  "scenarios": [
+    {
+      "case": "straight",
+      "error": null,
+      "gates": {
+        "valid_geometry": true,
+        "no_crossings": true,
+        "one_part_per_row": true,
+        "row_coverage_95pct_within_10cm": true,
+        "all_gaps_above_60cm_detected": true,
+        "all_near_threshold_gaps_detected": true,
+        "no_unmatched_gap_predictions": true,
+        "gap_length_error_at_most_10cm": true,
+        "minimum_50cm_respected": true
+      },
+      "matched": 8,
+      "expected": 8,
+      "max_length_error_m": 9.765627328306437e-05
+    },
+    {
+      "case": "straight_shifted",
+      "error": null,
+      "gates": {
+        "valid_geometry": true,
+        "no_crossings": true,
+        "one_part_per_row": true,
+        "row_coverage_95pct_within_10cm": true,
+        "all_gaps_above_60cm_detected": true,
+        "all_near_threshold_gaps_detected": true,
+        "no_unmatched_gap_predictions": true,
+        "gap_length_error_at_most_10cm": true,
+        "minimum_50cm_respected": true
+      },
+      "matched": 8,
+      "expected": 8,
+      "max_length_error_m": 9.765627328306437e-05
+    },
+    {
+      "case": "contour",
+      "error": null,
+      "gates": {
+        "valid_geometry": true,
+        "no_crossings": true,
+        "one_part_per_row": true,
+        "row_coverage_95pct_within_10cm": true,
+        "all_gaps_above_60cm_detected": true,
+        "all_near_threshold_gaps_detected": true,
+        "no_unmatched_gap_predictions": true,
+        "gap_length_error_at_most_10cm": true,
+        "minimum_50cm_respected": true
+      },
+      "matched": 8,
+      "expected": 8,
+      "max_length_error_m": 0.029449738180888252
+    },
+    {
+      "case": "oblique",
+      "error": null,
+      "gates": {
+        "valid_geometry": true,
+        "no_crossings": true,
+        "one_part_per_row": true,
+        "row_coverage_95pct_within_10cm": true,
+        "all_gaps_above_60cm_detected": true,
+        "all_near_threshold_gaps_detected": true,
+        "no_unmatched_gap_predictions": true,
+        "gap_length_error_at_most_10cm": true,
+        "minimum_50cm_respected": true
+      },
+      "matched": 8,
+      "expected": 8,
+      "max_length_error_m": 0.029296875281982437
+    },
+    {
+      "case": "yellow",
+      "error": null,
+      "gates": {
+        "valid_geometry": true,
+        "no_crossings": true,
+        "one_part_per_row": true,
+        "row_coverage_95pct_within_10cm": true,
+        "all_gaps_above_60cm_detected": true,
+        "all_near_threshold_gaps_detected": true,
+        "no_unmatched_gap_predictions": true,
+        "gap_length_error_at_most_10cm": true,
+        "minimum_50cm_respected": true
+      },
+      "matched": 8,
+      "expected": 8,
+      "max_length_error_m": 9.765627328306437e-05
+    },
+    {
+      "case": "automatic",
+      "error": null,
+      "gates": {
+        "valid_geometry": true,
+        "no_crossings": true,
+        "one_part_per_row": true,
+        "row_coverage_95pct_within_10cm": true,
+        "all_gaps_above_60cm_detected": true,
+        "all_near_threshold_gaps_detected": true,
+        "no_unmatched_gap_predictions": true,
+        "gap_length_error_at_most_10cm": true,
+        "minimum_50cm_respected": true
+      },
+      "matched": 8,
+      "expected": 8,
+      "max_length_error_m": 0.0015476969115650885
+    },
+    {
+      "case": "automatic_healthy",
+      "error": null,
+      "gates": {
+        "valid_geometry": true,
+        "no_crossings": true,
+        "one_part_per_row": true,
+        "row_coverage_95pct_within_10cm": true,
+        "all_gaps_above_60cm_detected": true,
+        "all_near_threshold_gaps_detected": true,
+        "no_unmatched_gap_predictions": true,
+        "gap_length_error_at_most_10cm": true,
+        "minimum_50cm_respected": true
+      },
+      "matched": 0,
+      "expected": 0,
+      "max_length_error_m": 0.0
+    },
+    {
+      "case": "automatic_oblique",
+      "error": null,
+      "gates": {
+        "valid_geometry": true,
+        "no_crossings": true,
+        "one_part_per_row": true,
+        "row_coverage_95pct_within_10cm": true,
+        "all_gaps_above_60cm_detected": true,
+        "all_near_threshold_gaps_detected": true,
+        "no_unmatched_gap_predictions": true,
+        "gap_length_error_at_most_10cm": true,
+        "minimum_50cm_respected": true
+      },
+      "matched": 8,
+      "expected": 8,
+      "max_length_error_m": 0.05000000022766171
+    },
+    {
+      "case": "automatic_contour",
+      "error": null,
+      "gates": {
+        "valid_geometry": true,
+        "no_crossings": true,
+        "one_part_per_row": true,
+        "row_coverage_95pct_within_10cm": true,
+        "all_gaps_above_60cm_detected": true,
+        "all_near_threshold_gaps_detected": true,
+        "no_unmatched_gap_predictions": true,
+        "gap_length_error_at_most_10cm": true,
+        "minimum_50cm_respected": true
+      },
+      "matched": 8,
+      "expected": 8,
+      "max_length_error_m": 0.03356189800018683
+    },
+    {
+      "case": "short_gap_leaf_overlap",
+      "error": null,
+      "gates": {
+        "valid_geometry": true,
+        "no_crossings": true,
+        "one_part_per_row": true,
+        "row_coverage_95pct_within_10cm": true,
+        "all_gaps_above_60cm_detected": true,
+        "all_near_threshold_gaps_detected": true,
+        "no_unmatched_gap_predictions": true,
+        "gap_length_error_at_most_10cm": true,
+        "minimum_50cm_respected": true
+      },
+      "matched": 8,
+      "expected": 8,
+      "max_length_error_m": 9.765627328306437e-05
+    },
+    {
+      "case": "automatic_large_gap",
+      "error": null,
+      "gates": {
+        "valid_geometry": true,
+        "no_crossings": true,
+        "one_part_per_row": true,
+        "row_coverage_95pct_within_10cm": true,
+        "all_gaps_above_60cm_detected": true,
+        "all_near_threshold_gaps_detected": true,
+        "no_unmatched_gap_predictions": true,
+        "gap_length_error_at_most_10cm": true,
+        "minimum_50cm_respected": true
+      },
+      "matched": 6,
+      "expected": 6,
+      "max_length_error_m": 0.0011318717985844273
+    },
+    {
+      "case": "automatic_large_contour_gap",
+      "error": null,
+      "gates": {
+        "valid_geometry": true,
+        "no_crossings": true,
+        "one_part_per_row": true,
+        "row_coverage_95pct_within_10cm": true,
+        "all_gaps_above_60cm_detected": true,
+        "all_near_threshold_gaps_detected": true,
+        "no_unmatched_gap_predictions": true,
+        "gap_length_error_at_most_10cm": true,
+        "minimum_50cm_respected": true
+      },
+      "matched": 6,
+      "expected": 6,
+      "max_length_error_m": 0.031237234643022305
+    }
+  ],
+  "real_audit": {
+    "baseline_2_5": {
+      "rows": 241,
+      "row_length_m": 52131.448074296815,
+      "origins": {
+        "observada": 241
+      },
+      "gaps": 5239,
+      "gap_length_m": 4757.748051082124,
+      "minimum_gap_m": 0.49999999983092225,
+      "gaps_150cm_or_longer": 491,
+      "gaps_3m_or_longer": 145,
+      "longest_gap_m": 8.38540956826894,
+      "invalid_rows": 0,
+      "invalid_gaps": 0,
+      "uncertain_length_m": 385.57,
+      "nodata_length_m": 29.45,
+      "evidence_counts": {
+        "ausencia_raster": 1414,
+        "solo_e_nucleo": 3825
+      },
+      "crossing_pairs_count": 11,
+      "off_row_gaps_count": 0
+    },
+    "revised_2_6": {
+      "rows": 241,
+      "row_length_m": 52113.956178700115,
+      "origins": {
+        "observada": 241
+      },
+      "gaps": 4437,
+      "gap_length_m": 4163.5867729350375,
+      "minimum_gap_m": 0.4999999998287808,
+      "gaps_150cm_or_longer": 473,
+      "gaps_3m_or_longer": 150,
+      "longest_gap_m": 8.149999999984258,
+      "invalid_rows": 0,
+      "invalid_gaps": 0,
+      "uncertain_length_m": 334.25,
+      "nodata_length_m": 9.1,
+      "evidence_counts": {
+        "ausencia_raster": 1266,
+        "solo_e_nucleo": 3171
+      },
+      "crossing_pairs_count": 0,
+      "off_row_gaps_count": 0
+    }
+  },
+  "agreement_30cm": {
+    "baseline": {
+      "ours_covered_pct": 70.07955216908356,
+      "inforow_covered_pct": 68.40487505779663
+    },
+    "revision": {
+      "ours_covered_pct": 75.45266964551047,
+      "inforow_covered_pct": 65.95490368133443
+    }
+  },
+  "common_area_m2": 78970.04230915313,
+  "note": "Functional tests and spatial agreement; not field accuracy or independent certification."
+}
